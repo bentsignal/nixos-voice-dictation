@@ -24,11 +24,13 @@ WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+/#-]{2,}")
 class ScreenContext:
     """Best-effort KDE screenshot OCR and conservative name correction."""
 
-    def __init__(self, enabled: bool) -> None:
+    def __init__(self, enabled: bool, toggle_file: Path | None = None) -> None:
         self.enabled = enabled
+        self.toggle_file = toggle_file
 
     def words(self) -> list[str]:
-        if not self.enabled:
+        enabled = self.toggle_file.exists() if self.toggle_file else self.enabled
+        if not enabled:
             return []
         try:
             with tempfile.TemporaryDirectory(prefix="whisrs-ocr-") as directory:
@@ -87,7 +89,10 @@ class ScreenContext:
 
 
 class Parakeet:
-    def __init__(self, model_dir: Path, threads: int, screen_context: bool) -> None:
+    def __init__(
+        self, model_dir: Path, threads: int, screen_context: bool,
+        screen_context_toggle_file: Path | None = None,
+    ) -> None:
         required = {
             "encoder": model_dir / "encoder.int8.onnx",
             "decoder": model_dir / "decoder.int8.onnx",
@@ -109,7 +114,9 @@ class Parakeet:
             model_type="nemo_transducer",
             decoding_method="greedy_search",
         )
-        self.screen_context = ScreenContext(screen_context)
+        self.screen_context = ScreenContext(
+            screen_context, screen_context_toggle_file
+        )
 
     def transcribe(self, wav_path: Path) -> str:
         with wave.open(str(wav_path), "rb") as wav:
@@ -170,12 +177,18 @@ def main() -> None:
         "--screen-context", action="store_true",
         help="use local KDE screenshot OCR as a conservative spelling hint",
     )
+    parser.add_argument(
+        "--screen-context-toggle-file", type=Path,
+        help="enable screen OCR only while this file exists",
+    )
     args = parser.parse_args()
     import uvicorn
 
     uvicorn.run(
         create_app(Parakeet(
-            args.model_dir.expanduser(), args.threads, args.screen_context
+            args.model_dir.expanduser(), args.threads, args.screen_context,
+            args.screen_context_toggle_file.expanduser()
+            if args.screen_context_toggle_file else None,
         )),
         host=args.host,
         port=args.port,

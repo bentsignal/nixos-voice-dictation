@@ -5,9 +5,13 @@
 
 mod parse;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 use evdev::{Device, EventType, InputEventKind, Key};
 use tokio::sync::mpsc;
@@ -21,6 +25,7 @@ const HOTKEY_MAX_RETRIES: u32 = 10;
 
 /// Initial retry delay (doubles each attempt, capped at 10 s).
 const HOTKEY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const QUICK_MENU_HOLD: Duration = Duration::from_secs(2);
 
 /// A configured hotkey action.
 struct HotkeyAction {
@@ -217,6 +222,7 @@ async fn listen_device(
 ) -> anyhow::Result<()> {
     // Track which keys are currently held.
     let mut held_keys: HashSet<Key> = HashSet::new();
+    let mut pending_toggles: HashMap<Key, (Instant, Arc<AtomicBool>)> = HashMap::new();
 
     // Wrap device in async fd.
     let mut stream = device.into_event_stream()?;
@@ -241,6 +247,21 @@ async fn listen_device(
                 // Check if any hotkey combo matches.
                 for (modifiers, trigger, command) in actions {
                     if key == *trigger && modifiers_held(&held_keys, modifiers) {
+                        // A standalone toggle fires on release so we can
+                        // distinguish a quick tap from a two-second hold.
+                        if matches!(command, Command::Toggle { .. }) && modifiers.is_empty() {
+                            let cancelled = Arc::new(AtomicBool::new(false));
+                            pending_toggles.insert(key, (Instant::now(), Arc::clone(&cancelled)));
+                            let hold_tx = cmd_tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(QUICK_MENU_HOLD).await;
+                                if !cancelled.swap(true, Ordering::SeqCst) {
+                                    debug!("toggle key held — opening quick menu");
+                                    let _ = hold_tx.send(Command::QuickMenu).await;
+                                }
+                            });
+                            continue;
+                        }
                         debug!("hotkey matched: {:?}", command);
                         let _ = cmd_tx.send(command.clone()).await;
                     }
@@ -249,6 +270,16 @@ async fn listen_device(
             0 => {
                 // Key release.
                 held_keys.remove(&key);
+                if let Some((pressed_at, cancelled)) = pending_toggles.remove(&key) {
+                    // If the hold task has not claimed the gesture, it was a
+                    // tap. Preserve the existing one-tap start/stop behavior.
+                    if !cancelled.swap(true, Ordering::SeqCst)
+                        && pressed_at.elapsed() < QUICK_MENU_HOLD
+                    {
+                        debug!("toggle key tapped");
+                        let _ = cmd_tx.send(Command::Toggle { language: None }).await;
+                    }
+                }
             }
             _ => {} // Repeat (2) — ignore.
         }

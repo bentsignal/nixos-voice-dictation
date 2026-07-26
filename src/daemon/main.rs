@@ -1,3 +1,4 @@
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
@@ -871,7 +872,118 @@ async fn handle_command(
         },
         Command::CommandMode => handle_command_mode(daemon_state, context).await,
         Command::Speak => handle_speak(daemon_state, context).await,
+        Command::QuickMenu => handle_quick_menu(daemon_state).await,
     }
+}
+
+fn ocr_toggle_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/home/shawn/.config"))
+        .join("whisrs")
+        .join("ocr-corrections-enabled")
+}
+
+async fn copy_last_transcript() -> Result<String> {
+    let entry = history::read_entries(1)?
+        .into_iter()
+        .next()
+        .context("No previous transcript is available yet")?;
+    let mut child = tokio::process::Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("failed to start wl-copy")?;
+    child
+        .stdin
+        .take()
+        .context("wl-copy stdin unavailable")?
+        .write_all(entry.text.as_bytes())
+        .await?;
+    let status = child.wait().await?;
+    anyhow::ensure!(status.success(), "wl-copy exited with {status}");
+    Ok(entry.text)
+}
+
+async fn handle_quick_menu(daemon_state: Arc<Mutex<DaemonState>>) -> Response {
+    let state = daemon_state.lock().await.state_machine.state();
+    if state != State::Idle {
+        send_notification(
+            "Voice transcription",
+            "Finish the current transcription before opening the menu.",
+        );
+        return Response::Ok { state };
+    }
+
+    let toggle_path = ocr_toggle_path();
+    let ocr_enabled = toggle_path.exists();
+    let ocr_label = if ocr_enabled {
+        "Disable OCR corrections (currently on)"
+    } else {
+        "Enable OCR corrections (currently off)"
+    };
+
+    let output = tokio::process::Command::new("kdialog")
+        .args([
+            "--title",
+            "Voice transcription",
+            "--menu",
+            "Quick actions",
+            "copy",
+            "Copy last transcript",
+            "ocr",
+            ocr_label,
+        ])
+        .output()
+        .await;
+
+    let choice = match output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(_) => return Response::Ok { state },
+        Err(e) => {
+            let message = format!("Could not open transcription menu: {e}");
+            warn!("{message}");
+            send_notification("Voice transcription", &message);
+            return Response::Error { message };
+        }
+    };
+
+    match choice.as_str() {
+        "copy" => match copy_last_transcript().await {
+            Ok(text) => {
+                send_notification("Last transcript copied", &truncate_preview(&text, 120));
+            }
+            Err(e) => send_notification("Voice transcription", &e.to_string()),
+        },
+        "ocr" => {
+            let result = if ocr_enabled {
+                std::fs::remove_file(&toggle_path)
+            } else {
+                toggle_path
+                    .parent()
+                    .map(std::fs::create_dir_all)
+                    .transpose()
+                    .and_then(|_| std::fs::write(&toggle_path, b"enabled\n"))
+            };
+            match result {
+                Ok(()) => {
+                    let status = if ocr_enabled { "off" } else { "on" };
+                    info!("OCR corrections toggled {status}");
+                    send_notification("Voice transcription", &format!("OCR corrections: {status}"));
+                }
+                Err(e) => {
+                    warn!("failed to toggle OCR corrections: {e}");
+                    send_notification(
+                        "Voice transcription",
+                        &format!("Could not toggle OCR corrections: {e}"),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Response::Ok { state }
 }
 
 async fn handle_toggle(

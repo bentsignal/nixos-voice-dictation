@@ -48,6 +48,9 @@ pub enum Command {
     /// stops any in-progress playback.
     #[serde(alias = "read")]
     Speak,
+    /// Show the quick-actions menu (normally triggered by holding the toggle key).
+    #[serde(rename = "quick-menu")]
+    QuickMenu,
 }
 
 fn default_log_limit() -> usize {
