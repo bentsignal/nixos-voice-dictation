@@ -1,4 +1,8 @@
 /target
+/result
+**/.venv/
+**/__pycache__/
+*.pyc
 /fixtures/
 crates/*/target/
 crates/*/Cargo.lock

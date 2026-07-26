@@ -11,7 +11,8 @@ pub struct HotkeyBinding {
     pub trigger: Key,
 }
 
-/// Parse a hotkey string like "Super+Shift+D" into a `HotkeyBinding`.
+/// Parse a hotkey string like "Super+Shift+D" or a standalone key such as
+/// "RightAlt" into a `HotkeyBinding`.
 ///
 /// Format: `Modifier+Modifier+Key` (case-insensitive).
 /// Supported modifiers: Super, Alt, Ctrl, Shift.
@@ -20,10 +21,13 @@ pub fn parse_hotkey(s: &str) -> anyhow::Result<HotkeyBinding> {
     if parts.is_empty() {
         anyhow::bail!("empty hotkey string");
     }
-    if parts.len() < 2 {
-        anyhow::bail!(
-            "hotkey must have at least one modifier and a key (e.g. \"Super+D\"), got: {s}"
-        );
+    if parts.len() == 1 {
+        let trigger = parse_key(parts[0])
+            .ok_or_else(|| anyhow::anyhow!("unknown key '{}' in hotkey '{s}'", parts[0]))?;
+        return Ok(HotkeyBinding {
+            modifiers: Vec::new(),
+            trigger,
+        });
     }
 
     let mut modifiers = Vec::new();
@@ -105,6 +109,14 @@ fn parse_key(s: &str) -> Option<Key> {
         "down" => Some(Key::KEY_DOWN),
         "left" => Some(Key::KEY_LEFT),
         "right" => Some(Key::KEY_RIGHT),
+        "leftalt" | "altleft" => Some(Key::KEY_LEFTALT),
+        "rightalt" | "altright" | "altgr" => Some(Key::KEY_RIGHTALT),
+        "leftctrl" | "ctrlleft" => Some(Key::KEY_LEFTCTRL),
+        "rightctrl" | "ctrlright" => Some(Key::KEY_RIGHTCTRL),
+        "leftshift" | "shiftleft" => Some(Key::KEY_LEFTSHIFT),
+        "rightshift" | "shiftright" => Some(Key::KEY_RIGHTSHIFT),
+        "leftsuper" | "superleft" | "leftmeta" => Some(Key::KEY_LEFTMETA),
+        "rightsuper" | "superright" | "rightmeta" => Some(Key::KEY_RIGHTMETA),
         "f1" => Some(Key::KEY_F1),
         "f2" => Some(Key::KEY_F2),
         "f3" => Some(Key::KEY_F3),
@@ -163,8 +175,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_no_modifier_fails() {
-        assert!(parse_hotkey("D").is_err());
+    fn parse_standalone_right_alt() {
+        let binding = parse_hotkey("RightAlt").unwrap();
+        assert!(binding.modifiers.is_empty());
+        assert_eq!(binding.trigger, Key::KEY_RIGHTALT);
     }
 
     #[test]

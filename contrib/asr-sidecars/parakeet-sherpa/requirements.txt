@@ -1,0 +1,5 @@
+fastapi>=0.115
+numpy>=1.26
+python-multipart>=0.0.20
+sherpa-onnx>=1.12
+uvicorn>=0.30

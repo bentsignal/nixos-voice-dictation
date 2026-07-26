@@ -183,10 +183,18 @@ fn enumerate_keyboards() -> anyhow::Result<Vec<Device>> {
 
         match Device::open(&path) {
             Ok(device) => {
-                // Check if this device has keyboard capabilities.
+                // Composite USB keyboards sometimes expose modifier keys on a
+                // secondary event node that does not advertise the full A-Z
+                // key set. Include any node that can emit Right Alt so a
+                // standalone RightAlt toggle is not silently missed.
                 if let Some(keys) = device.supported_keys() {
-                    if keys.contains(Key::KEY_A) && keys.contains(Key::KEY_LEFTMETA) {
-                        let dev_name = device.name().unwrap_or("unknown").to_string();
+                    let dev_name = device.name().unwrap_or("unknown").to_string();
+                    let is_virtual_keyboard = dev_name == "whisrs virtual keyboard";
+                    let looks_like_keyboard =
+                        keys.contains(Key::KEY_A) && keys.contains(Key::KEY_LEFTMETA);
+                    if !is_virtual_keyboard
+                        && (looks_like_keyboard || keys.contains(Key::KEY_RIGHTALT))
+                    {
                         debug!("found keyboard: {} ({})", dev_name, path.display());
                         keyboards.push(device);
                     }

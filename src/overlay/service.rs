@@ -291,7 +291,14 @@ impl OverlayBackend {
     fn detect() -> Self {
         let session_is_wayland = matches_env("XDG_SESSION_TYPE", "wayland");
         let session_is_x11 = matches_env("XDG_SESSION_TYPE", "x11");
-        if (env_var_is_set("WAYLAND_DISPLAY") || session_is_wayland) && !session_is_x11 {
+        // Plasma/KWin does not expose the wlroots layer-shell protocol used by
+        // the native Wayland renderer.  KWin does, however, host XWayland and
+        // the X11 renderer is an override-redirect, click-through notification
+        // window, which gives us the same bottom-centre HUD without stealing
+        // focus.
+        if is_kde_desktop() && env_var_is_set("DISPLAY") {
+            Self::X11
+        } else if (env_var_is_set("WAYLAND_DISPLAY") || session_is_wayland) && !session_is_x11 {
             Self::Wayland
         } else if env_var_is_set("DISPLAY") {
             Self::X11
@@ -307,6 +314,16 @@ fn env_var_is_set(name: &str) -> bool {
 
 fn matches_env(name: &str, expected: &str) -> bool {
     std::env::var(name).is_ok_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+fn is_kde_desktop() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|value| {
+            value
+                .split(':')
+                .any(|part| part.eq_ignore_ascii_case("KDE"))
+        })
+        .unwrap_or(false)
 }
 
 fn is_gnome_desktop() -> bool {
