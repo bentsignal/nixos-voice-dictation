@@ -59,6 +59,7 @@ use wayland_client::{
     Connection as WaylandConnection, Dispatch, QueueHandle,
 };
 use x11rb::connection::{Connection as X11Connection, RequestConnection};
+use x11rb::properties::WmHints;
 use x11rb::protocol::{
     randr::{ConnectionExt as X11RandrConnectionExt, MonitorInfo, X11_EXTENSION_NAME as RANDR_EXT},
     shape::{ConnectionExt as X11ShapeConnectionExt, SK, SO, X11_EXTENSION_NAME as SHAPE_EXT},
@@ -693,6 +694,15 @@ fn set_x11_window_hints(
     window: Window,
     atoms: &X11Atoms,
 ) -> Result<(), OverlayError> {
+    // Override-redirect windows normally avoid window-manager focus handling,
+    // but explicitly mark this HUD as non-input as well. XWayland compositors
+    // and Electron clients can otherwise react to the overlay being mapped by
+    // dropping focus from an embedded text field even though the application
+    // window itself remains active.
+    let mut wm_hints = WmHints::new();
+    wm_hints.input = Some(false);
+    wm_hints.set(conn, window)?;
+
     conn.change_property8(
         PropMode::REPLACE,
         window,
