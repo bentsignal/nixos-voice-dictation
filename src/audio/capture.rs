@@ -1,6 +1,6 @@
 //! Audio capture using the `cpal` crate.
 //!
-//! Opens the default input device at 16kHz mono 16-bit and pushes audio
+//! Opens the configured input device at 16kHz mono 16-bit and pushes audio
 //! chunks into a tokio mpsc channel for downstream processing.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,9 +61,20 @@ impl AudioCaptureHandle {
     pub fn start_with_level_tx(
         level_tx: Option<tokio::sync::watch::Sender<f32>>,
     ) -> anyhow::Result<Self> {
+        Self::start_with_device_and_level_tx("default", level_tx)
+    }
+
+    /// Start capturing from a named input device and optionally publish a
+    /// normalized volume level. The special name `default` selects the host's
+    /// default input device.
+    pub fn start_with_device_and_level_tx(
+        device_name: &str,
+        level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    ) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<AudioChunk>();
         let stop_signal = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop_signal);
+        let device_name = device_name.to_string();
 
         // Channel to send back any initialization error from the thread.
         let (init_tx, init_rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
@@ -71,7 +82,7 @@ impl AudioCaptureHandle {
         let thread_handle = std::thread::Builder::new()
             .name("whisrs-audio".into())
             .spawn(move || {
-                run_capture(tx, stop_clone, init_tx, level_tx);
+                run_capture(tx, stop_clone, init_tx, level_tx, device_name);
             })
             .context("failed to spawn audio capture thread")?;
 
@@ -138,8 +149,9 @@ fn run_capture(
     stop_signal: Arc<AtomicBool>,
     init_tx: std::sync::mpsc::Sender<anyhow::Result<()>>,
     level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    configured_device: String,
 ) {
-    let result = setup_and_run(tx, stop_signal, &init_tx, level_tx);
+    let result = setup_and_run(tx, stop_signal, &init_tx, level_tx, &configured_device);
     if let Err(e) = result {
         // If init_tx hasn't been used yet, send the error.
         init_tx.send(Err(e)).ok();
@@ -151,11 +163,18 @@ fn setup_and_run(
     stop_signal: Arc<AtomicBool>,
     init_tx: &std::sync::mpsc::Sender<anyhow::Result<()>>,
     level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    configured_device: &str,
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("no default audio input device found"))?;
+    let device = if configured_device.eq_ignore_ascii_case("default") {
+        host.default_input_device()
+            .ok_or_else(|| anyhow::anyhow!("no default audio input device found"))?
+    } else {
+        host.input_devices()
+            .context("failed to enumerate audio input devices")?
+            .find(|device| device.name().is_ok_and(|name| name == configured_device))
+            .ok_or_else(|| anyhow::anyhow!("audio input device not found: {configured_device}"))?
+    };
 
     let device_name = device.name().unwrap_or_else(|_| "unknown".into());
     info!("using audio input device: {device_name}");

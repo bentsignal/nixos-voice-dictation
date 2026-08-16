@@ -1,5 +1,8 @@
 # NixOS voice dictation setup
 
+For the equivalent Arch/EndeavourOS installation, see
+[`LOCAL-LINUX-SETUP.md`](LOCAL-LINUX-SETUP.md).
+
 This fork contains the machine-local integration used on Shawn's KDE Plasma
 Wayland workstation:
 

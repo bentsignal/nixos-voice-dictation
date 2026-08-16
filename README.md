@@ -27,6 +27,9 @@ Dictation tools like Wispr Flow and Superwhisper are not available on Linux. [xh
 
 ## Installation
 
+For this fork's fully local Parakeet setup on NixOS and Arch/EndeavourOS, see
+[`LOCAL-LINUX-SETUP.md`](LOCAL-LINUX-SETUP.md).
+
 ### Quick install (Linux x86_64 / aarch64)
 
 ```bash

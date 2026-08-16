@@ -1,0 +1,18 @@
+[Unit]
+Description=Always-on local voice dictation
+Documentation=https://github.com/y0sif/whisrs
+After=graphical-session.target pipewire.service parakeet-sidecar.service
+Wants=parakeet-sidecar.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/whisrsd
+Restart=on-failure
+RestartSec=3
+Environment=XKB_DEFAULT_LAYOUT=us
+PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE NIRI_SOCKET SWAYSOCK WAYLAND_DISPLAY DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_RUNTIME_DIR
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

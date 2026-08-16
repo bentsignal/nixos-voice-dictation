@@ -1022,20 +1022,22 @@ async fn handle_toggle(
             };
 
             // Start recording.
-            let mut capture =
-                match AudioCaptureHandle::start_with_level_tx(context.overlay_level_tx.clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        let friendly = if msg.contains("no default audio input device") {
-                            format_no_microphone_error()
-                        } else {
-                            format!("Failed to start audio capture: {e}")
-                        };
-                        error!("{friendly}");
-                        return Response::Error { message: friendly };
-                    }
-                };
+            let mut capture = match AudioCaptureHandle::start_with_device_and_level_tx(
+                &context.config.audio.device,
+                context.overlay_level_tx.clone(),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    let friendly = if msg.contains("no default audio input device") {
+                        format_no_microphone_error()
+                    } else {
+                        format!("Failed to start audio capture: {e}")
+                    };
+                    error!("{friendly}");
+                    return Response::Error { message: friendly };
+                }
+            };
 
             // For streaming backends: start the streaming pipeline immediately.
             // Audio flows in real-time from microphone → API → text at cursor.
@@ -2156,15 +2158,17 @@ async fn command_mode_start(
         feedback::play_start(context.config.general.audio_feedback_volume);
     }
 
-    let mut capture =
-        match AudioCaptureHandle::start_with_level_tx(context.overlay_level_tx.clone()) {
-            Ok(c) => c,
-            Err(e) => {
-                return Response::Error {
-                    message: format!("failed to start audio capture: {e}"),
-                };
-            }
-        };
+    let mut capture = match AudioCaptureHandle::start_with_device_and_level_tx(
+        &context.config.audio.device,
+        context.overlay_level_tx.clone(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return Response::Error {
+                message: format!("failed to start audio capture: {e}"),
+            };
+        }
+    };
 
     let audio_rx = capture.take_receiver();
 

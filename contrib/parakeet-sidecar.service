@@ -1,0 +1,13 @@
+[Unit]
+Description=Local Parakeet speech recognition for whisrs
+Documentation=https://github.com/y0sif/whisrs
+After=graphical-session.target network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/whisrs/parakeet-sidecar/.venv/bin/python %h/.local/share/whisrs/parakeet-sidecar/server.py --model-dir %h/.local/share/whisrs/models/parakeet-v3-int8 --threads 8 --screen-context-toggle-file %h/.config/whisrs/ocr-corrections-enabled
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
