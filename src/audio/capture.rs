@@ -255,20 +255,24 @@ fn audio_level(data: &[i16]) -> f32 {
         return 0.0;
     }
 
+    let mut peak = 0.0_f32;
     let sum_squares: f32 = data
         .iter()
         .map(|sample| {
-            let normalized = *sample as f32 / i16::MAX as f32;
+            let normalized = (*sample as f32 / i16::MAX as f32).abs();
+            peak = peak.max(normalized);
             normalized * normalized
         })
         .sum();
     let rms = (sum_squares / data.len() as f32).sqrt();
 
-    // Soft compressor: 1 - exp(-k*rms). k=18 maps typical speech RMS
-    // (~0.05–0.15) to the 0.6–0.95 range, so the visualizer reaches the
-    // top of its dynamic range during normal speech instead of hovering
-    // around 30 % deflection.
-    (1.0 - (-rms * 18.0).exp()).clamp(0.0, 1.0)
+    // RMS alone changes slowly across normal speech and can make the HUD look
+    // pinned at one height. Blend in the instantaneous peak so consonants and
+    // syllable attacks remain visible, while RMS keeps the meter from becoming
+    // a jittery peak indicator. The gentler compressor preserves more dynamic
+    // range than the former RMS-only k=18 curve.
+    let envelope = rms * 0.35 + peak * 0.65;
+    (1.0 - (-envelope * 7.0).exp()).clamp(0.0, 1.0)
 }
 
 /// Encode raw PCM samples (16kHz, mono, i16) to a WAV byte buffer.
@@ -326,5 +330,19 @@ mod tests {
     fn encode_wav_empty_samples() {
         let wav = encode_wav(&[]).unwrap();
         assert_eq!(&wav[..4], b"RIFF");
+    }
+
+    #[test]
+    fn audio_level_reacts_to_transient_peaks() {
+        let steady = vec![1_000_i16; 256];
+        let mut transient = steady.clone();
+        transient[128] = 12_000;
+
+        assert!(audio_level(&transient) > audio_level(&steady) * 2.0);
+    }
+
+    #[test]
+    fn audio_level_silence_is_zero() {
+        assert_eq!(audio_level(&[0; 256]), 0.0);
     }
 }

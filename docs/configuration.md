@@ -32,6 +32,7 @@ overlay = false             # bottom-screen recording overlay (Hyprland/Sway, GN
 theme = "carbon"            # "carbon" (default) | "ember" | "cyan" | "custom"
 width = 100                 # 90..=120 (clamped)
 height = 40                 # 36..=48 (clamped)
+sensitivity = 1.0          # waveform gain, 0.1..=8.0
 
 # When theme = "custom", these override the named theme. Hex strings:
 # #RGB, #RRGGBB, or #RRGGBBAA. Anything missing falls back to carbon.

@@ -110,8 +110,6 @@ const BARS_FADE_MS: f32 = 80.0;
 const BAR_COUNT: u32 = 7;
 const BAR_W: f32 = 3.0;
 const BAR_GAP: f32 = 2.0;
-const BAR_PITCH: f32 = BAR_W + BAR_GAP;
-const BAR_BLOCK_W: f32 = BAR_COUNT as f32 * BAR_W + (BAR_COUNT - 1) as f32 * BAR_GAP;
 const BAR_BASELINE: f32 = 6.0;
 const BAR_VPAD: f32 = 6.0;
 
@@ -436,6 +434,7 @@ fn run_overlay(
 ) -> Result<(), OverlayError> {
     let width = config.clamped_width();
     let height = config.clamped_height();
+    let sensitivity = config.clamped_sensitivity();
     let theme = Theme::from_config(&config);
 
     let conn = WaylandConnection::connect_to_env()?;
@@ -469,7 +468,9 @@ fn run_overlay(
         shm,
         pool,
         layer,
-        renderer: OverlayRenderer::new(state_rx, level_rx, width, height, theme)?,
+        renderer: OverlayRenderer::new(state_rx, level_rx, width, height, theme, sensitivity)?,
+        logical_width: width,
+        logical_height: height,
         exit: false,
         first_configure: true,
     };
@@ -493,6 +494,7 @@ fn run_x11_overlay(
 ) -> Result<(), OverlayError> {
     let width = config.clamped_width() as u16;
     let height = config.clamped_height() as u16;
+    let sensitivity = config.clamped_sensitivity();
     let theme = Theme::from_config(&config);
 
     let (conn, screen_num) = RustConnection::connect(None)?;
@@ -532,8 +534,14 @@ fn run_x11_overlay(
     conn.create_gc(gc, window, &CreateGCAux::default().graphics_exposures(0))?;
     conn.flush()?;
 
-    let mut renderer =
-        OverlayRenderer::new(state_rx, level_rx, width as u32, height as u32, theme)?;
+    let mut renderer = OverlayRenderer::new(
+        state_rx,
+        level_rx,
+        width as u32,
+        height as u32,
+        theme,
+        sensitivity,
+    )?;
     let mut frame = vec![0_u8; width as usize * height as usize * 4];
     let mut mapped = false;
     // Cache of the last bounding-shape rectangles applied to the window.
@@ -979,6 +987,8 @@ struct Overlay {
     pool: SlotPool,
     layer: LayerSurface,
     renderer: OverlayRenderer,
+    logical_width: u32,
+    logical_height: u32,
     exit: bool,
     first_configure: bool,
 }
@@ -988,6 +998,7 @@ struct OverlayRenderer {
     level_rx: mpsc::Receiver<f32>,
     width: u32,
     height: u32,
+    scale: f32,
     pixmap: Pixmap,
     target_state: State,
     visible_state: State,
@@ -1015,6 +1026,7 @@ struct OverlayRenderer {
     /// Wall-clock instant of the previous spring step.
     last_update: Instant,
     theme: Theme,
+    sensitivity: f32,
 }
 
 /// Per-frame animation state computed from `spawn_t` + `spawn_in`. The
@@ -1045,6 +1057,7 @@ impl OverlayRenderer {
         width: u32,
         height: u32,
         theme: Theme,
+        sensitivity: f32,
     ) -> Result<Self, OverlayError> {
         let pixmap = Pixmap::new(width, height).ok_or(OverlayError::Pixmap(width, height))?;
         Ok(Self {
@@ -1052,6 +1065,7 @@ impl OverlayRenderer {
             level_rx,
             width,
             height,
+            scale: 1.0,
             pixmap,
             target_state: State::Idle,
             visible_state: State::Idle,
@@ -1064,7 +1078,18 @@ impl OverlayRenderer {
             level_velocity: 0.0,
             last_update: Instant::now(),
             theme,
+            sensitivity,
         })
+    }
+
+    fn set_output_scale(&mut self, scale: u32) -> Result<(), OverlayError> {
+        let scale = scale.max(1);
+        self.scale = scale as f32;
+        self.width = self.width.saturating_mul(scale);
+        self.height = self.height.saturating_mul(scale);
+        self.pixmap = Pixmap::new(self.width, self.height)
+            .ok_or(OverlayError::Pixmap(self.width, self.height))?;
+        Ok(())
     }
 
     fn apply_state_updates(&mut self) {
@@ -1102,7 +1127,7 @@ impl OverlayRenderer {
         // `dt`, so it doesn't matter how many samples we drained.
         loop {
             match self.level_rx.try_recv() {
-                Ok(new) => self.level_target = new.clamp(0.0, 1.0),
+                Ok(new) => self.level_target = (new * self.sensitivity).clamp(0.0, 1.0),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.disconnected = true;
@@ -1206,7 +1231,8 @@ impl OverlayRenderer {
     fn draw_frame(&mut self) {
         self.apply_state_updates();
 
-        let anim = self.anim(self.height as f32);
+        let mut anim = self.anim(self.height as f32);
+        anim.pill_height = anim.pill_height.max(SPAWN_PILL_MIN_H * self.scale);
         let level_gated = if anim.bars_locked { 0.0 } else { self.level };
         draw_overlay(
             &mut self.pixmap,
@@ -1215,6 +1241,7 @@ impl OverlayRenderer {
             level_gated,
             anim,
             &self.theme,
+            self.scale,
         );
         self.frame = self.frame.wrapping_add(1);
     }
@@ -1320,8 +1347,27 @@ impl CompositorHandler for Overlay {
         _conn: &WaylandConnection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        new_factor: i32,
     ) {
+        let scale = new_factor.max(1) as u32;
+        let current = self.renderer.scale as u32;
+        if scale == current {
+            return;
+        }
+        self.layer.wl_surface().set_buffer_scale(scale as i32);
+        self.renderer.width = self.logical_width;
+        self.renderer.height = self.logical_height;
+        if let Err(error) = self.renderer.set_output_scale(scale) {
+            warn!("failed to resize overlay for output scale {scale}: {error}");
+            return;
+        }
+        match SlotPool::new(
+            (self.renderer.width * self.renderer.height * 4) as usize,
+            &self.shm,
+        ) {
+            Ok(pool) => self.pool = pool,
+            Err(error) => warn!("failed to resize overlay buffer pool: {error}"),
+        }
     }
 
     fn transform_changed(
@@ -1461,6 +1507,7 @@ fn draw_overlay(
     level: f32,
     anim: AnimState,
     theme: &Theme,
+    scale: f32,
 ) {
     pixmap.fill(Color::TRANSPARENT);
 
@@ -1470,7 +1517,7 @@ fn draw_overlay(
 
     let surface_w = pixmap.width() as f32;
     let surface_h = pixmap.height() as f32;
-    let pill_h = anim.pill_height.clamp(SPAWN_PILL_MIN_H, surface_h);
+    let pill_h = anim.pill_height.clamp(SPAWN_PILL_MIN_H * scale, surface_h);
     let pill_y = surface_h - pill_h; // bottom-anchored
     let pill_w = surface_w;
 
@@ -1488,8 +1535,14 @@ fn draw_overlay(
         pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
     }
 
-    if pill_w > 2.0 && pill_h > 2.0 {
-        let inner = build_stadium(1.0, pill_y + 1.0, pill_w - 2.0, pill_h - 2.0);
+    let ring = scale;
+    if pill_w > ring * 2.0 && pill_h > ring * 2.0 {
+        let inner = build_stadium(
+            ring,
+            pill_y + ring,
+            pill_w - ring * 2.0,
+            pill_h - ring * 2.0,
+        );
         if let Some(path) = &inner {
             let mut paint = Paint {
                 anti_alias: true,
@@ -1512,13 +1565,13 @@ fn draw_overlay(
     // visually; the bars just don't follow its center-of-mass.
     let pill_cy = surface_h / 2.0;
     match state {
-        State::Recording => draw_bars(pixmap, theme, theme.rec_bar, level, anim, pill_cy),
+        State::Recording => draw_bars(pixmap, theme, theme.rec_bar, level, anim, pill_cy, scale),
         // Read-aloud playback reuses the equalizer bars in a distinct hue,
         // driven by the spoken audio amplitude.
-        State::Speaking => draw_bars(pixmap, theme, theme.speak_bar, level, anim, pill_cy),
+        State::Speaking => draw_bars(pixmap, theme, theme.speak_bar, level, anim, pill_cy, scale),
         // Synthesizing reuses the transcribing "working on it" shimmer.
         State::Transcribing | State::Synthesizing => {
-            draw_sweep(pixmap, theme, frame, anim, pill_cy)
+            draw_sweep(pixmap, theme, frame, anim, pill_cy, scale)
         }
         State::Idle => {}
     }
@@ -1622,12 +1675,19 @@ fn draw_bars(
     level: f32,
     anim: AnimState,
     pill_cy: f32,
+    scale: f32,
 ) {
+    let bar_w = BAR_W * scale;
+    let bar_gap = BAR_GAP * scale;
+    let bar_pitch = bar_w + bar_gap;
+    let bar_block_w = BAR_COUNT as f32 * bar_w + (BAR_COUNT - 1) as f32 * bar_gap;
+    let baseline = BAR_BASELINE * scale;
+    let vpad = BAR_VPAD * scale;
     let surface_w = pixmap.width() as f32;
     // Track the *currently displayed* pill height so bars stay within the
     // pill while it's still growing during the spawn animation.
-    let max_h = (anim.pill_height - BAR_VPAD * 2.0).max(BAR_BASELINE + 2.0);
-    let bar_x_start = (surface_w - BAR_BLOCK_W) / 2.0;
+    let max_h = (anim.pill_height - vpad * 2.0).max(baseline + 2.0 * scale);
+    let bar_x_start = (surface_w - bar_block_w) / 2.0;
 
     for i in 0..BAR_COUNT {
         let taper = taper_factor(i, BAR_COUNT);
@@ -1637,8 +1697,8 @@ fn draw_bars(
         // translating instead of expanding, which reads as "moving up
         // and down" rather than "amplitude".
         let effective = (level * taper).clamp(0.0, 1.0);
-        let h = (BAR_BASELINE + effective * (max_h - BAR_BASELINE)).max(BAR_BASELINE);
-        let bx = bar_x_start + i as f32 * BAR_PITCH;
+        let h = (baseline + effective * (max_h - baseline)).max(baseline);
+        let bx = bar_x_start + i as f32 * bar_pitch;
         let by = pill_cy - h / 2.0;
 
         // Glow halo behind the bar — only visible above a small threshold.
@@ -1652,9 +1712,9 @@ fn draw_bars(
                 glow_a.clamp(0.0, 1.0),
             )
             .unwrap_or(Color::TRANSPARENT);
-            let glow_w = BAR_W + 2.0;
-            let glow_h = (h + 2.0).max(BAR_BASELINE + 2.0);
-            if let Some(path) = build_stadium(bx - 1.0, pill_cy - glow_h / 2.0, glow_w, glow_h) {
+            let glow_w = bar_w + 2.0 * scale;
+            let glow_h = (h + 2.0 * scale).max(baseline + 2.0 * scale);
+            if let Some(path) = build_stadium(bx - scale, pill_cy - glow_h / 2.0, glow_w, glow_h) {
                 let mut paint = Paint {
                     anti_alias: true,
                     ..Default::default()
@@ -1670,7 +1730,7 @@ fn draw_bars(
             }
         }
 
-        if let Some(path) = build_stadium(bx, by, BAR_W, h) {
+        if let Some(path) = build_stadium(bx, by, bar_w, h) {
             let mut paint = Paint {
                 anti_alias: true,
                 ..Default::default()
@@ -1690,10 +1750,23 @@ fn draw_bars(
 /// Transcribing state: no audio level, just a center-out shimmer that
 /// travels across the bar row to communicate "working on it" without
 /// flat staticness.
-fn draw_sweep(pixmap: &mut Pixmap, theme: &Theme, frame: u32, anim: AnimState, pill_cy: f32) {
+fn draw_sweep(
+    pixmap: &mut Pixmap,
+    theme: &Theme,
+    frame: u32,
+    anim: AnimState,
+    pill_cy: f32,
+    scale: f32,
+) {
+    let bar_w = BAR_W * scale;
+    let bar_gap = BAR_GAP * scale;
+    let bar_pitch = bar_w + bar_gap;
+    let bar_block_w = BAR_COUNT as f32 * bar_w + (BAR_COUNT - 1) as f32 * bar_gap;
+    let baseline = BAR_BASELINE * scale;
+    let vpad = BAR_VPAD * scale;
     let surface_w = pixmap.width() as f32;
-    let max_h = (anim.pill_height - BAR_VPAD * 2.0).max(BAR_BASELINE + 2.0);
-    let bar_x_start = (surface_w - BAR_BLOCK_W) / 2.0;
+    let max_h = (anim.pill_height - vpad * 2.0).max(baseline + 2.0 * scale);
+    let bar_x_start = (surface_w - bar_block_w) / 2.0;
 
     // Sliding focus point that pings back and forth across the row.
     let cycle = (BAR_COUNT as i32) * 2 - 2;
@@ -1710,8 +1783,8 @@ fn draw_sweep(pixmap: &mut Pixmap, theme: &Theme, frame: u32, anim: AnimState, p
         // Bell-shaped intensity centered on `active`, ~3 bars wide.
         let intensity = (-dist * dist / 4.0).exp().max(0.15);
         let dynamic = intensity * taper;
-        let h = (BAR_BASELINE + dynamic * (max_h - BAR_BASELINE) * 0.85).max(BAR_BASELINE);
-        let bx = bar_x_start + i as f32 * BAR_PITCH;
+        let h = (baseline + dynamic * (max_h - baseline) * 0.85).max(baseline);
+        let bx = bar_x_start + i as f32 * bar_pitch;
         let by = pill_cy - h / 2.0;
 
         let bar_a = theme.trans_bar[0] as f32 / 255.0 * (0.3 + 0.7 * intensity) * anim.bar_alpha;
@@ -1723,7 +1796,7 @@ fn draw_sweep(pixmap: &mut Pixmap, theme: &Theme, frame: u32, anim: AnimState, p
         )
         .unwrap_or(Color::TRANSPARENT);
 
-        if let Some(path) = build_stadium(bx, by, BAR_W, h) {
+        if let Some(path) = build_stadium(bx, by, bar_w, h) {
             let mut paint = Paint {
                 anti_alias: true,
                 ..Default::default()
@@ -1772,7 +1845,7 @@ mod tests {
     fn idle_draw_is_transparent() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Idle, 0, 0.0, hidden(), &t);
+        draw_overlay(&mut pm, State::Idle, 0, 0.0, hidden(), &t, 1.0);
         assert!(pm.data().iter().all(|b| *b == 0));
     }
 
@@ -1780,7 +1853,7 @@ mod tests {
     fn faded_out_draw_is_transparent() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Recording, 0, 1.0, hidden(), &t);
+        draw_overlay(&mut pm, State::Recording, 0, 1.0, hidden(), &t, 1.0);
         assert!(pm.data().iter().all(|b| *b == 0));
     }
 
@@ -1788,7 +1861,7 @@ mod tests {
     fn active_draw_has_visible_pixels() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Recording, 0, 1.0, shown(), &t);
+        draw_overlay(&mut pm, State::Recording, 0, 1.0, shown(), &t, 1.0);
         // tiny-skia stores premultiplied RGBA; alpha lives in the 4th byte.
         assert!(pm.data().chunks_exact(4).any(|px| px[3] != 0));
     }
@@ -1808,8 +1881,8 @@ mod tests {
         let t = Theme::ember();
         let mut rec = fresh_pixmap();
         let mut spk = fresh_pixmap();
-        draw_overlay(&mut rec, State::Recording, 0, 1.0, shown(), &t);
-        draw_overlay(&mut spk, State::Speaking, 0, 1.0, shown(), &t);
+        draw_overlay(&mut rec, State::Recording, 0, 1.0, shown(), &t, 1.0);
+        draw_overlay(&mut spk, State::Speaking, 0, 1.0, shown(), &t, 1.0);
         let rec_green = green_dominant(rec.data());
         let spk_green = green_dominant(spk.data());
         assert!(
@@ -1823,7 +1896,7 @@ mod tests {
     fn synthesizing_draws_visible_pixels() {
         let mut pm = fresh_pixmap();
         let t = Theme::ember();
-        draw_overlay(&mut pm, State::Synthesizing, 0, 0.0, shown(), &t);
+        draw_overlay(&mut pm, State::Synthesizing, 0, 0.0, shown(), &t, 1.0);
         assert!(pm.data().chunks_exact(4).any(|px| px[3] != 0));
     }
 
@@ -1878,8 +1951,8 @@ mod tests {
         let t = Theme::ember();
         let mut quiet = fresh_pixmap();
         let mut loud = fresh_pixmap();
-        draw_overlay(&mut quiet, State::Recording, 0, 0.0, shown(), &t);
-        draw_overlay(&mut loud, State::Recording, 0, 1.0, shown(), &t);
+        draw_overlay(&mut quiet, State::Recording, 0, 0.0, shown(), &t, 1.0);
+        draw_overlay(&mut loud, State::Recording, 0, 1.0, shown(), &t, 1.0);
         let count_quiet = amber_pixels(quiet.data());
         let count_loud = amber_pixels(loud.data());
         assert!(

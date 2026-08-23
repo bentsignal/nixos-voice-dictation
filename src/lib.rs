@@ -165,6 +165,9 @@ pub struct OverlayConfig {
     /// Pill height in pixels (clamped to 28..=40).
     #[serde(default = "default_overlay_height")]
     pub height: u32,
+    /// Multiplier applied to recording levels before drawing the waveform.
+    #[serde(default = "default_overlay_sensitivity")]
+    pub sensitivity: f32,
     /// Custom color overrides; honored when `theme = "custom"`.
     /// Hex strings: `#RGB`, `#RRGGBB`, or `#RRGGBBAA`.
     #[serde(default)]
@@ -191,6 +194,9 @@ fn default_overlay_width() -> u32 {
 fn default_overlay_height() -> u32 {
     40
 }
+fn default_overlay_sensitivity() -> f32 {
+    1.0
+}
 
 impl Default for OverlayConfig {
     fn default() -> Self {
@@ -198,6 +204,7 @@ impl Default for OverlayConfig {
             theme: default_overlay_theme(),
             width: default_overlay_width(),
             height: default_overlay_height(),
+            sensitivity: default_overlay_sensitivity(),
             colors: None,
         }
     }
@@ -211,6 +218,9 @@ impl OverlayConfig {
     }
     pub fn clamped_height(&self) -> u32 {
         self.height.clamp(36, 48)
+    }
+    pub fn clamped_sensitivity(&self) -> f32 {
+        self.sensitivity.clamp(0.1, 8.0)
     }
 }
 
