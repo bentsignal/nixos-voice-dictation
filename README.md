@@ -8,12 +8,15 @@
   speak. type. done.
 ```
 
-# whisrs
+# Voice Dictation
 
 [![Crates.io](https://img.shields.io/crates/v/whisrs)](https://crates.io/crates/whisrs)
 [![docs.rs](https://img.shields.io/docsrs/whisrs)](https://docs.rs/whisrs)
 
 **Linux-first voice-to-text dictation tool, written in Rust.**
+
+The command-line programs and Rust package retain their upstream names,
+`whisrs` and `whisrsd`.
 
 Speech-to-text for Wayland, X11, Hyprland, Sway, Niri, GNOME, and KDE. Press a hotkey, speak, and your words appear at the cursor. Works with any app, any window manager, any desktop environment. Supports cloud transcription (Groq, Deepgram, OpenAI) and fully offline local transcription via whisper.cpp. Fast, private, open source. It can also read the selected text back aloud (text-to-speech via Groq, OpenAI, Deepgram, or a local sidecar).
 

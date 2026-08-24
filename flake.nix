@@ -1,5 +1,5 @@
 {
-  description = "whisrs — Linux-first voice-to-text dictation tool";
+  description = "Voice Dictation — Linux-first voice-to-text dictation tool";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -41,7 +41,7 @@
 
           meta = with pkgs.lib; {
             description = "Linux-first voice-to-text dictation tool";
-            homepage = "https://github.com/y0sif/whisrs";
+            homepage = "https://github.com/bentsignal/voice-dictation";
             license = licenses.mit;
             platforms = platforms.linux;
             mainProgram = "whisrs";
