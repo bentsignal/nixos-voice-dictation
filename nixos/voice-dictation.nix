@@ -64,7 +64,7 @@ in
       Restart = "on-failure";
       RestartSec = 3;
     };
-    path = [ pkgs.kdePackages.kdialog pkgs.wl-clipboard ];
+    path = [ pkgs.kdePackages.kdialog pkgs.wl-clipboard pkgs.pipewire ];
     environment.ALSA_CONFIG_PATH = "${project}/nixos/whisrs-alsa.conf";
   };
 

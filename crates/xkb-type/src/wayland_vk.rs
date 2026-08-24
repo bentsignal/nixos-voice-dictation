@@ -170,6 +170,11 @@ pub(crate) fn xkb_to_evdev_keycode(xkb_keycode: u32) -> u32 {
 /// pressing this key, but the key must exist so the `modifier_map` resolves.
 const SHIFT_XKB_KEYCODE: u32 = 50;
 
+/// XKB keycodes for modifiers used by application shortcuts.
+const CTRL_XKB_KEYCODE: u32 = 37;
+const ALT_XKB_KEYCODE: u32 = 64;
+const SUPER_XKB_KEYCODE: u32 = 133;
+
 /// XKB keycode of the AltGr / `ISO_Level3_Shift` key, present in every keymap
 /// and bound via `modifier_map Mod5`. `KEY_RIGHTALT` (evdev 100) + 8. Mirrors
 /// the uinput backend (`keymap.rs`), which also drives third-level glyphs
@@ -183,6 +188,11 @@ const ALTGR_XKB_KEYCODE: u32 = 108;
 /// modifier at index 0 — mask bit `1 << 0`. Fixed by the keymap, not
 /// layout-dependent (asserted in `modifier_masks_select_levels`).
 const SHIFT_MOD_MASK: u32 = 1 << 0;
+
+/// Standard XKB modifier masks fixed by the keymap below.
+const CTRL_MOD_MASK: u32 = 1 << 2;
+const ALT_MOD_MASK: u32 = 1 << 3;
+const SUPER_MOD_MASK: u32 = 1 << 6;
 
 /// Modifier **mask** that selects **level 2** (AltGr / `ISO_Level3_Shift`).
 ///
@@ -439,10 +449,12 @@ fn base_keys() -> Vec<BaseKey> {
     // same. Shift and AltGr are the modifiers we press to reach levels 1 and 2.
     let entries: &[(Key, &'static str)] = &[
         (Key::KEY_BACKSPACE, "BackSpace"),
+        (Key::KEY_INSERT, "Insert"),
         (Key::KEY_LEFTCTRL, "Control_L"),
         (Key::KEY_RIGHTCTRL, "Control_R"),
         (Key::KEY_LEFTSHIFT, "Shift_L"),
         (Key::KEY_LEFTALT, "Alt_L"),
+        (Key::KEY_LEFTMETA, "Super_L"),
         // AltGr: drives third-level (non-ASCII) glyphs. `KEY_RIGHTALT` + 8.
         (Key::KEY_RIGHTALT, "ISO_Level3_Shift"),
         // Whitespace keys that have no XKB keysym via `utf32_to_keysym`
@@ -566,9 +578,19 @@ pub(crate) fn build_keymap_string(chars: &[char]) -> (String, HashMap<char, Char
             b.keycode, b.keysym_name
         ));
     }
-    // Bind Shift and AltGr so the modifiers we press select levels 1 and 2.
+    // Bind all modifiers used by text levels and application shortcuts. The
+    // virtual-keyboard protocol carries these as a depressed-modifier mask;
+    // merely emitting a physical modifier keycode is racy on Hyprland and can
+    // turn Ctrl+V into a bare `v`.
     keymap.push_str(&format!(
         "modifier_map Shift {{ <K{SHIFT_XKB_KEYCODE}> }};\n"
+    ));
+    keymap.push_str(&format!(
+        "modifier_map Control {{ <K{CTRL_XKB_KEYCODE}> }};\n"
+    ));
+    keymap.push_str(&format!("modifier_map Mod1 {{ <K{ALT_XKB_KEYCODE}> }};\n"));
+    keymap.push_str(&format!(
+        "modifier_map Mod4 {{ <K{SUPER_XKB_KEYCODE}> }};\n"
     ));
     keymap.push_str(&format!(
         "modifier_map Mod5 {{ <K{ALTGR_XKB_KEYCODE}> }};\n"
@@ -1084,20 +1106,59 @@ impl KeyInjector for WaylandVkKeyboard {
         if !self.keymap_uploaded {
             self.upload_keymap(&[])?;
         }
-        // Press each key (evdev code + 8) in order, release in reverse.
-        for key in keys {
-            let keycode = u32::from(key.code()) + 8;
-            self.emit_key(keycode, KEY_STATE_PRESSED)?;
+
+        // Declare modifiers atomically through the protocol. Sending their
+        // physical keycodes does not reliably update the compositor's
+        // modifier state before the following key arrives (the observed
+        // failure mode is Ctrl+V producing a literal `v`).
+        let modifier_mask = keys
+            .iter()
+            .filter_map(|key| combo_modifier_mask(*key))
+            .fold(0, |mask, modifier| mask | modifier);
+        if modifier_mask != 0 {
+            self.set_modifiers(modifier_mask)?;
         }
-        for key in keys.iter().rev() {
-            let keycode = u32::from(key.code()) + 8;
-            self.emit_key(keycode, KEY_STATE_RELEASED)?;
-        }
-        Ok(())
+
+        let non_modifiers: Vec<_> = keys
+            .iter()
+            .copied()
+            .filter(|key| combo_modifier_mask(*key).is_none())
+            .collect();
+        let result = (|| -> anyhow::Result<()> {
+            for key in &non_modifiers {
+                let keycode = u32::from(key.code()) + 8;
+                self.emit_key(keycode, KEY_STATE_PRESSED)?;
+            }
+            for key in non_modifiers.iter().rev() {
+                let keycode = u32::from(key.code()) + 8;
+                self.emit_key(keycode, KEY_STATE_RELEASED)?;
+            }
+            Ok(())
+        })();
+
+        let clear_result = if modifier_mask != 0 {
+            self.set_modifiers(0)
+        } else {
+            Ok(())
+        };
+        result?;
+        clear_result
     }
 
     fn set_key_delay(&mut self, delay: Duration) {
         self.key_delay = delay;
+    }
+}
+
+fn combo_modifier_mask(key: evdev::Key) -> Option<u32> {
+    use evdev::Key;
+    match key {
+        Key::KEY_LEFTSHIFT | Key::KEY_RIGHTSHIFT => Some(SHIFT_MOD_MASK),
+        Key::KEY_LEFTCTRL | Key::KEY_RIGHTCTRL => Some(CTRL_MOD_MASK),
+        Key::KEY_LEFTALT => Some(ALT_MOD_MASK),
+        Key::KEY_RIGHTALT => Some(ALTGR_MOD_MASK),
+        Key::KEY_LEFTMETA | Key::KEY_RIGHTMETA => Some(SUPER_MOD_MASK),
+        _ => None,
     }
 }
 
@@ -1508,10 +1569,12 @@ mod tests {
         use evdev::Key;
         for key in [
             Key::KEY_BACKSPACE,
+            Key::KEY_INSERT,
             Key::KEY_LEFTCTRL,
             Key::KEY_RIGHTCTRL,
             Key::KEY_LEFTSHIFT,
             Key::KEY_LEFTALT,
+            Key::KEY_LEFTMETA,
             Key::KEY_RIGHTALT,
             Key::KEY_ENTER,
             Key::KEY_TAB,
@@ -1642,6 +1705,7 @@ mod tests {
         use evdev::Key;
         for (key, expected_name) in [
             (Key::KEY_BACKSPACE, "BackSpace"),
+            (Key::KEY_INSERT, "Insert"),
             (Key::KEY_ENTER, "Return"),
             (Key::KEY_TAB, "Tab"),
             (Key::KEY_LEFTCTRL, "Control_L"),
@@ -1739,6 +1803,21 @@ mod tests {
             "Shift modifier index mismatch with SHIFT_MOD_MASK"
         );
         assert_eq!(
+            keymap.mod_get_index(xkb::MOD_NAME_CTRL),
+            CTRL_MOD_MASK.trailing_zeros(),
+            "Control modifier index mismatch with CTRL_MOD_MASK"
+        );
+        assert_eq!(
+            keymap.mod_get_index("Mod1"),
+            ALT_MOD_MASK.trailing_zeros(),
+            "Mod1 modifier index mismatch with ALT_MOD_MASK"
+        );
+        assert_eq!(
+            keymap.mod_get_index("Mod4"),
+            SUPER_MOD_MASK.trailing_zeros(),
+            "Mod4 modifier index mismatch with SUPER_MOD_MASK"
+        );
+        assert_eq!(
             keymap.mod_get_index("Mod5"),
             ALTGR_MOD_MASK.trailing_zeros(),
             "Mod5/AltGr modifier index mismatch with ALTGR_MOD_MASK"
@@ -1772,5 +1851,17 @@ mod tests {
         eprintln!(
             "modifier-mask OK: Shift={SHIFT_MOD_MASK} Mod5={ALTGR_MOD_MASK} select levels 1/2"
         );
+    }
+
+    #[test]
+    fn combo_modifiers_map_to_protocol_masks() {
+        use evdev::Key;
+        assert_eq!(combo_modifier_mask(Key::KEY_LEFTCTRL), Some(CTRL_MOD_MASK));
+        assert_eq!(
+            combo_modifier_mask(Key::KEY_LEFTSHIFT),
+            Some(SHIFT_MOD_MASK)
+        );
+        assert_eq!(combo_modifier_mask(Key::KEY_LEFTMETA), Some(SUPER_MOD_MASK));
+        assert_eq!(combo_modifier_mask(Key::KEY_V), None);
     }
 }

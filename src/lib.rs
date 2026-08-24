@@ -341,9 +341,43 @@ pub enum InjectorBackend {
     WaylandVk,
 }
 
+/// How completed transcription text is inserted into the focused application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputMode {
+    /// Emit one virtual key press per character.
+    #[default]
+    Type,
+    /// Put the complete transcript on the clipboard, paste it once, then
+    /// restore the previous clipboard text.
+    Paste,
+}
+
+impl std::fmt::Display for OutputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Type => write!(f, "type"),
+            Self::Paste => write!(f, "paste"),
+        }
+    }
+}
+
+/// Dictation preferences that can be changed live from the system tray.
+///
+/// These start from `config.toml`, are shared with the daemon's recording
+/// path, and are persisted when a tray selection changes.
+#[derive(Debug, Clone)]
+pub struct DictationPreferences {
+    pub output_mode: OutputMode,
+    pub audio_device: String,
+}
+
 /// Keyboard injection (uinput) tuning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputConfig {
+    /// How transcription text is inserted into the focused application.
+    #[serde(default)]
+    pub output_mode: OutputMode,
     /// Delay between individual key events, in milliseconds. Raise this if
     /// characters are dropped by TUIs that read stdin in raw mode (e.g.
     /// Node/Ink-based apps like Claude Code).
@@ -361,6 +395,7 @@ pub struct InputConfig {
 impl Default for InputConfig {
     fn default() -> Self {
         Self {
+            output_mode: OutputMode::default(),
             key_delay_ms: default_key_delay_ms(),
             backend: InjectorBackend::default(),
         }
@@ -1389,6 +1424,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(input.backend, InjectorBackend::WaylandVk);
+    }
+
+    #[test]
+    fn output_mode_toml_roundtrip_and_back_compat() {
+        let paste: InputConfig = toml::from_str(
+            r#"
+            output_mode = "paste"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(paste.output_mode, OutputMode::Paste);
+
+        let legacy: InputConfig = toml::from_str(
+            r#"
+            key_delay_ms = 5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(legacy.output_mode, OutputMode::Type);
+        assert!(toml::to_string(&paste)
+            .unwrap()
+            .contains("output_mode = \"paste\""));
     }
 
     #[test]

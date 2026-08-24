@@ -191,6 +191,11 @@ Env-var overrides: `WHISRS_GROQ_API_KEY`, `WHISRS_DEEPGRAM_API_KEY`, `WHISRS_OPE
 
 For the full reference (overlay, `[input]`, `[openai-compatible-realtime]`, `[asr-sidecar]`, `[llm]`, `[hotkeys]`, GNOME extension setup), see [docs/configuration.md](docs/configuration.md).
 
+When the tray icon is enabled, click it to switch between per-key typing and
+one-shot paste output, or to choose a microphone used only by whisrs. Tray
+changes take effect on the next recording and are saved to `config.toml`.
+Paste mode restores the previous clipboard text after inserting a transcript.
+
 ---
 
 ## CLI Commands

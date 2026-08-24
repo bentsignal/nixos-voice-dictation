@@ -1,6 +1,6 @@
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -30,7 +30,7 @@ use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::{self, WindowTracker};
 use whisrs::{
     encode_message, read_message, socket_path, validate_language_override, Command, Config,
-    InjectorBackend, LocalWhisperConfig, Response, State,
+    DictationPreferences, InjectorBackend, LocalWhisperConfig, OutputMode, Response, State,
 };
 
 static KEYBOARD: OnceLock<StdMutex<Option<Box<dyn xkb_type::KeyInjector>>>> = OnceLock::new();
@@ -69,6 +69,10 @@ struct DaemonState {
     /// Consumed when the session ends so an override never leaks into a
     /// later recording.
     session_language: Option<String>,
+    /// Output method captured when this recording started.
+    session_output_mode: OutputMode,
+    /// Whether the recording target uses terminal-style Ctrl+Shift+V paste.
+    recording_is_terminal: bool,
     /// Active command mode context (set when command mode is recording).
     command_mode: Option<CommandModeContext>,
     /// Stop flag for in-progress TTS playback (read-selection-aloud).
@@ -90,6 +94,8 @@ impl DaemonState {
             streaming_cancel: None,
             recording_started_at: None,
             session_language: None,
+            session_output_mode: OutputMode::Type,
+            recording_is_terminal: false,
             command_mode: None,
             tts_stop: None,
         }
@@ -108,6 +114,8 @@ impl DaemonState {
 /// Resources shared across all connections (not behind the per-request mutex).
 struct DaemonContext {
     config: Config,
+    /// Live tray-controlled preferences. Read once at recording start.
+    preferences: Arc<RwLock<DictationPreferences>>,
     window_tracker: Arc<dyn WindowTracker>,
     transcription_backend: Arc<dyn TranscriptionBackend>,
     notify: bool,
@@ -135,6 +143,16 @@ impl DaemonContext {
     /// can't carry their detail.
     fn notify_error(&self) -> bool {
         self.notify
+    }
+
+    fn dictation_preferences(&self) -> DictationPreferences {
+        self.preferences
+            .read()
+            .map(|preferences| preferences.clone())
+            .unwrap_or_else(|_| DictationPreferences {
+                output_mode: self.config.input.output_mode,
+                audio_device: self.config.audio.device.clone(),
+            })
     }
 }
 
@@ -733,8 +751,14 @@ async fn main() -> Result<()> {
     let tray_enabled = config.general.tray;
     let overlay_enabled = config.general.overlay;
     let overlay_config = config.overlay.clone().unwrap_or_default();
+    let preferences = Arc::new(RwLock::new(DictationPreferences {
+        output_mode: config.input.output_mode,
+        audio_device: config.audio.device.clone(),
+    }));
+    let audio_devices = whisrs::audio::capture::input_device_choices(&config.audio.device);
     let context = Arc::new(DaemonContext {
         config,
+        preferences: Arc::clone(&preferences),
         window_tracker,
         transcription_backend: backend,
         notify,
@@ -746,7 +770,11 @@ async fn main() -> Result<()> {
     // Start system tray if enabled.
     // Spawned as a background task so retries don't block the IPC server.
     if tray_enabled {
-        tokio::spawn(whisrs::tray::spawn_tray(state_rx.clone()));
+        tokio::spawn(whisrs::tray::spawn_tray(
+            state_rx.clone(),
+            preferences,
+            audio_devices,
+        ));
     }
 
     // Start bottom recording overlay if enabled.
@@ -1008,6 +1036,9 @@ async fn handle_toggle(
             // config default. Persisted in `DaemonState` below so the
             // stop-toggle can apply it to the batch path and history too.
             let session_language = resolve_language(language, &context.config.general.language);
+            let preferences = context.dictation_preferences();
+            let output_mode = preferences.output_mode;
+            let audio_device = preferences.audio_device;
 
             // Capture focused window before recording.
             let window_id = match context.window_tracker.get_focused_window() {
@@ -1020,10 +1051,15 @@ async fn handle_toggle(
                     None
                 }
             };
+            let is_terminal = context
+                .window_tracker
+                .get_focused_window_class()
+                .map(|class| is_terminal_class(&class))
+                .unwrap_or(false);
 
             // Start recording.
             let mut capture = match AudioCaptureHandle::start_with_device_and_level_tx(
-                &context.config.audio.device,
+                &audio_device,
                 context.overlay_level_tx.clone(),
             ) {
                 Ok(c) => c,
@@ -1105,6 +1141,8 @@ async fn handle_toggle(
                         pipeline_state_tx,
                         pipeline_key_delay,
                         pipeline_injector_backend,
+                        output_mode,
+                        is_terminal,
                         pipeline_cancel,
                     )
                     .await
@@ -1125,6 +1163,8 @@ async fn handle_toggle(
             ds.recording_window_id = window_id;
             ds.recording_started_at = Some(std::time::Instant::now());
             ds.session_language = Some(session_language);
+            ds.session_output_mode = output_mode;
+            ds.recording_is_terminal = is_terminal;
 
             match ds.state_machine.transition(Action::Toggle) {
                 Ok(new_state) => {
@@ -1145,6 +1185,8 @@ async fn handle_toggle(
                     ds.streaming_task = None;
                     ds.streaming_cancel = None;
                     ds.session_language = None;
+                    ds.session_output_mode = OutputMode::Type;
+                    ds.recording_is_terminal = false;
                     Response::Error {
                         message: e.to_string(),
                     }
@@ -1175,6 +1217,10 @@ async fn handle_toggle(
                     // pipeline drains and types the remaining text.
                     ds.streaming_cancel = None;
                     let recording_started_at = ds.recording_started_at.take();
+                    let output_mode = ds.session_output_mode;
+                    let is_terminal = ds.recording_is_terminal;
+                    ds.session_output_mode = OutputMode::Type;
+                    ds.recording_is_terminal = false;
                     // The language this session was started with. Consuming it
                     // here ends the language session.
                     let session_language =
@@ -1215,6 +1261,8 @@ async fn handle_toggle(
                             window_id.as_deref(),
                             &context,
                             &session_language,
+                            output_mode,
+                            is_terminal,
                         )
                         .await
                     };
@@ -1337,6 +1385,8 @@ async fn run_streaming_pipeline(
     state_tx: tokio::sync::watch::Sender<State>,
     key_delay: std::time::Duration,
     injector_backend: InjectorBackend,
+    output_mode: OutputMode,
+    is_terminal: bool,
     cancel_flag: Arc<AtomicBool>,
 ) -> Result<String> {
     // State-progress toasts are noise when the overlay is on.
@@ -1369,6 +1419,7 @@ async fn run_streaming_pipeline(
     // We collect deltas for a short window to avoid creating a new virtual
     // keyboard for every single word delta from the streaming API.
     let wid = window_id.clone();
+    let paste_tracker = Arc::clone(&window_tracker);
     let typing_cancel = Arc::clone(&cancel_flag);
     let typing_task = tokio::spawn(async move {
         // Focus the original window before the first batch (only once).
@@ -1380,6 +1431,9 @@ async fn run_streaming_pipeline(
             let tracker = Arc::clone(&window_tracker);
             let focused = Arc::clone(&focused);
             async move {
+                if output_mode == OutputMode::Paste {
+                    return;
+                }
                 // Focus the original window (only once, or re-focus if needed).
                 if !focused.swap(true, Ordering::SeqCst) {
                     if let Some(wid) = &wid {
@@ -1500,6 +1554,32 @@ async fn run_streaming_pipeline(
             }
         }
     };
+
+    // Paste mode deliberately buffers all streaming deltas and inserts the
+    // final transcript in one operation. This is also used for streaming
+    // backends that flush several minutes of speech only after stop.
+    if output_mode == OutputMode::Paste
+        && !full_text.is_empty()
+        && !cancel_flag.load(Ordering::SeqCst)
+    {
+        if let Some(wid) = &window_id {
+            if let Err(error) = paste_tracker.focus_window(wid) {
+                warn!("failed to refocus window {wid} before paste: {error}");
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        let text_to_paste = full_text.clone();
+        match tokio::task::spawn_blocking(move || {
+            paste_text_at_cursor(&text_to_paste, key_delay, injector_backend, is_terminal)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!("failed to paste transcription: {error:#}"),
+            Err(error) => warn!("failed to join paste task: {error}"),
+        }
+    }
 
     // Notify user about streaming errors. Errors always pop, even with the
     // overlay on — the overlay can't carry the failure detail.
@@ -1640,6 +1720,8 @@ async fn process_recording_batch(
     window_id: Option<&str>,
     context: &DaemonContext,
     language: &str,
+    output_mode: OutputMode,
+    is_terminal: bool,
 ) -> Result<String> {
     use whisrs::audio::capture::encode_wav;
 
@@ -1771,12 +1853,15 @@ async fn process_recording_batch(
         }
     }
 
-    // Type the text at the cursor.
+    // Insert the text at the cursor using the session's selected output mode.
     let text_clone = text.clone();
     let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
     let injector_backend = context.config.input.backend;
-    match tokio::task::spawn_blocking(move || {
-        type_text_at_cursor(&text_clone, key_delay, injector_backend)
+    match tokio::task::spawn_blocking(move || match output_mode {
+        OutputMode::Type => type_text_at_cursor(&text_clone, key_delay, injector_backend),
+        OutputMode::Paste => {
+            paste_text_at_cursor(&text_clone, key_delay, injector_backend, is_terminal)
+        }
     })
     .await
     {
@@ -1864,6 +1949,88 @@ fn type_text_at_cursor(
     }
     result?;
     Ok(())
+}
+
+/// Paste a complete transcript in one operation and restore the prior
+/// clipboard text after the destination has had time to consume it.
+fn paste_text_at_cursor(
+    text: &str,
+    key_delay: std::time::Duration,
+    backend: InjectorBackend,
+    is_terminal: bool,
+) -> Result<()> {
+    let clipboard = xkb_type::default_clipboard();
+    paste_with_clipboard_restore(
+        clipboard.as_ref(),
+        text,
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(500),
+        || {
+            let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
+            let mut keyboard_guard = keyboard_slot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("keyboard mutex poisoned"))?;
+            if keyboard_guard.is_none() {
+                *keyboard_guard = Some(new_keyboard(
+                    key_delay, /* prewarm = */ false, backend,
+                )?);
+            }
+            let keyboard = keyboard_guard
+                .as_mut()
+                .expect("keyboard exists after initialization");
+            keyboard.set_key_delay(key_delay);
+            let keys: &[evdev::Key] = if is_terminal {
+                // Match Omarchy's universal-paste terminal path. Shift+Insert
+                // is supported by terminals that reserve Ctrl+V for literal
+                // input and avoids routing through a desktop-global Super bind.
+                &[evdev::Key::KEY_LEFTSHIFT, evdev::Key::KEY_INSERT]
+            } else {
+                &[evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_V]
+            };
+            let result = keyboard
+                .send_combo(keys)
+                .context("failed to inject transcription paste shortcut");
+            if result.is_err() {
+                *keyboard_guard = None;
+            }
+            result
+        },
+    )
+}
+
+fn paste_with_clipboard_restore(
+    clipboard: &dyn xkb_type::ClipboardBackend,
+    text: &str,
+    clipboard_settle: std::time::Duration,
+    restore_delay: std::time::Duration,
+    paste: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    // An empty Wayland clipboard is reported by wl-paste as an error rather
+    // than as an empty string. That is safe to preserve as empty; continue to
+    // reject other read failures so we never overwrite clipboard data we
+    // could not save.
+    let saved = match clipboard.get_text() {
+        Ok(saved) => saved,
+        Err(error) if format!("{error:#}").contains("Nothing is copied") => String::new(),
+        Err(error) => {
+            return Err(error).context("failed to save clipboard before transcription paste")
+        }
+    };
+    clipboard
+        .set_text(text)
+        .context("failed to set clipboard for transcription paste")?;
+    std::thread::sleep(clipboard_settle);
+
+    let paste_result = paste();
+
+    // Clipboard reads can be asynchronous in GUI applications. Match the
+    // command-mode grace period before restoring the saved content.
+    std::thread::sleep(restore_delay);
+    let restore_result = clipboard
+        .set_text(&saved)
+        .context("failed to restore clipboard after transcription paste");
+    paste_result?;
+    restore_result
 }
 
 fn warm_keyboard(key_delay: std::time::Duration, backend: InjectorBackend) {
@@ -2158,8 +2325,9 @@ async fn command_mode_start(
         feedback::play_start(context.config.general.audio_feedback_volume);
     }
 
+    let audio_device = context.dictation_preferences().audio_device;
     let mut capture = match AudioCaptureHandle::start_with_device_and_level_tx(
-        &context.config.audio.device,
+        &audio_device,
         context.overlay_level_tx.clone(),
     ) {
         Ok(c) => c,
@@ -2892,6 +3060,8 @@ async fn handle_cancel(
             }
             ds.recording_window_id = None;
             ds.session_language = None;
+            ds.session_output_mode = OutputMode::Type;
+            ds.recording_is_terminal = false;
             if let Some(level_tx) = &context.overlay_level_tx {
                 let _ = level_tx.send(0.0);
             }
@@ -3355,5 +3525,107 @@ mod tests {
         let full_text = batcher.await.unwrap();
         assert_eq!(full_text, "");
         assert!(typed.lock().unwrap().is_empty());
+    }
+
+    struct TestClipboard {
+        contents: StdMutex<String>,
+        writes: StdMutex<Vec<String>>,
+        empty_is_error: bool,
+    }
+
+    impl TestClipboard {
+        fn new(contents: &str) -> Self {
+            Self {
+                contents: StdMutex::new(contents.to_string()),
+                writes: StdMutex::new(Vec::new()),
+                empty_is_error: false,
+            }
+        }
+
+        fn empty_wayland_clipboard() -> Self {
+            Self {
+                contents: StdMutex::new(String::new()),
+                writes: StdMutex::new(Vec::new()),
+                empty_is_error: true,
+            }
+        }
+    }
+
+    impl xkb_type::ClipboardBackend for TestClipboard {
+        fn get_text(&self) -> anyhow::Result<String> {
+            if self.empty_is_error && self.contents.lock().unwrap().is_empty() {
+                anyhow::bail!("wl-paste failed: Nothing is copied");
+            }
+            Ok(self.contents.lock().unwrap().clone())
+        }
+
+        fn set_text(&self, text: &str) -> anyhow::Result<()> {
+            *self.contents.lock().unwrap() = text.to_string();
+            self.writes.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+
+        fn get_primary_selection(&self) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn paste_restores_previous_clipboard_after_success() {
+        let clipboard = TestClipboard::new("keep me");
+        paste_with_clipboard_restore(
+            &clipboard,
+            "new transcript",
+            Duration::ZERO,
+            Duration::ZERO,
+            || {
+                assert_eq!(
+                    xkb_type::ClipboardBackend::get_text(&clipboard)?,
+                    "new transcript"
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*clipboard.contents.lock().unwrap(), "keep me");
+        assert_eq!(
+            *clipboard.writes.lock().unwrap(),
+            vec!["new transcript".to_string(), "keep me".to_string()]
+        );
+    }
+
+    #[test]
+    fn paste_restores_previous_clipboard_when_shortcut_fails() {
+        let clipboard = TestClipboard::new("keep me");
+        let result = paste_with_clipboard_restore(
+            &clipboard,
+            "new transcript",
+            Duration::ZERO,
+            Duration::ZERO,
+            || anyhow::bail!("paste shortcut failed"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(*clipboard.contents.lock().unwrap(), "keep me");
+    }
+
+    #[test]
+    fn paste_works_when_wayland_clipboard_is_empty() {
+        let clipboard = TestClipboard::empty_wayland_clipboard();
+        paste_with_clipboard_restore(
+            &clipboard,
+            "new transcript",
+            Duration::ZERO,
+            Duration::ZERO,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(*clipboard.contents.lock().unwrap(), "");
+        assert_eq!(
+            *clipboard.writes.lock().unwrap(),
+            vec!["new transcript".to_string(), "".to_string()]
+        );
     }
 }

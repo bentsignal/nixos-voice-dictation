@@ -1,10 +1,15 @@
 //! System tray implementation using ksni (StatusNotifierItem).
 
+use std::io::Write;
+use std::sync::{Arc, RwLock};
+
+use anyhow::Context;
 use ksni::{Icon, ToolTip, TrayMethods};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::State;
+use crate::audio::capture::InputDeviceChoice;
+use crate::{DictationPreferences, OutputMode, State};
 
 /// 16x16 ARGB icon data for each state.
 /// Format: each pixel is 4 bytes (ARGB, big-endian).
@@ -72,9 +77,14 @@ struct TrayState {
 /// The ksni tray implementation.
 struct WhisrsTray {
     state: TrayState,
+    preferences: Arc<RwLock<DictationPreferences>>,
+    audio_devices: Vec<InputDeviceChoice>,
 }
 
 impl ksni::Tray for WhisrsTray {
+    // A click on the top-bar icon should expose the controls directly.
+    const MENU_ON_ACTIVATE: bool = true;
+
     fn id(&self) -> String {
         "whisrs".to_string()
     }
@@ -105,7 +115,7 @@ impl ksni::Tray for WhisrsTray {
     }
 
     fn tool_tip(&self) -> ToolTip {
-        let description = match self.state.current {
+        let state_description = match self.state.current {
             State::Idle => "Idle — ready to record",
             State::Recording => "Recording...",
             State::Transcribing => "Transcribing...",
@@ -114,10 +124,204 @@ impl ksni::Tray for WhisrsTray {
         };
         ToolTip {
             title: "whisrs".to_string(),
-            description: description.to_string(),
+            description: match self.preferences.read() {
+                Ok(preferences) => format!(
+                    "{state_description}\nOutput: {} · Microphone: {}",
+                    preferences.output_mode,
+                    self.device_label(&preferences.audio_device)
+                ),
+                Err(_) => state_description.to_string(),
+            },
             icon_name: String::new(),
             icon_pixmap: Vec::new(),
         }
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::{RadioGroup, RadioItem, StandardItem};
+
+        let preferences = self
+            .preferences
+            .read()
+            .map(|settings| settings.clone())
+            .unwrap_or_else(|_| DictationPreferences {
+                output_mode: OutputMode::Type,
+                audio_device: "default".to_string(),
+            });
+        let enabled = self.state.current == State::Idle;
+        let selected_device = self
+            .audio_devices
+            .iter()
+            .position(|device| device.id == preferences.audio_device)
+            .unwrap_or(0);
+
+        vec![
+            StandardItem {
+                label: format!("Output — {}", preferences.output_mode),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            RadioGroup {
+                selected: match preferences.output_mode {
+                    OutputMode::Type => 0,
+                    OutputMode::Paste => 1,
+                },
+                select: Box::new(|tray: &mut Self, selected| {
+                    let mode = if selected == 1 {
+                        OutputMode::Paste
+                    } else {
+                        OutputMode::Type
+                    };
+                    tray.update_preferences(|preferences| {
+                        preferences.output_mode = mode;
+                    });
+                }),
+                options: vec![
+                    RadioItem {
+                        label: "Type individual keys".to_string(),
+                        enabled,
+                        ..Default::default()
+                    },
+                    RadioItem {
+                        label: "Paste all at once".to_string(),
+                        enabled,
+                        ..Default::default()
+                    },
+                ],
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            StandardItem {
+                label: format!(
+                    "Microphone — {}",
+                    self.device_label(&preferences.audio_device)
+                ),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            RadioGroup {
+                selected: selected_device,
+                select: Box::new(|tray: &mut Self, selected| {
+                    let Some(device) = tray
+                        .audio_devices
+                        .get(selected)
+                        .map(|choice| choice.id.clone())
+                    else {
+                        return;
+                    };
+                    tray.update_preferences(|preferences| {
+                        preferences.audio_device = device;
+                    });
+                }),
+                options: self
+                    .audio_devices
+                    .iter()
+                    .map(|device| RadioItem {
+                        label: device.label.clone(),
+                        enabled,
+                        ..Default::default()
+                    })
+                    .collect(),
+            }
+            .into(),
+        ]
+    }
+}
+
+impl WhisrsTray {
+    fn device_label(&self, id: &str) -> String {
+        self.audio_devices
+            .iter()
+            .find(|choice| choice.id == id)
+            .map(|choice| choice.label.clone())
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    fn update_preferences(&self, update: impl FnOnce(&mut DictationPreferences)) {
+        let snapshot = match self.preferences.write() {
+            Ok(mut preferences) => {
+                update(&mut preferences);
+                preferences.clone()
+            }
+            Err(_) => {
+                warn!("could not update tray preferences: lock poisoned");
+                return;
+            }
+        };
+
+        if let Err(error) = persist_preferences(&snapshot) {
+            warn!("could not persist tray preferences: {error:#}");
+        } else {
+            info!(
+                "dictation preferences updated (output={}, microphone={})",
+                snapshot.output_mode, snapshot.audio_device
+            );
+        }
+    }
+}
+
+/// Update only the tray-controlled keys while preserving comments, API keys,
+/// and the rest of the user's TOML formatting.
+fn persist_preferences(preferences: &DictationPreferences) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let config_path = crate::config_path();
+    let source = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let updated = update_preferences_document(&source, preferences)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+
+    let parent = config_path
+        .parent()
+        .context("config path does not have a parent directory")?;
+    let temp_name = format!(
+        ".config.toml.whisrs-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let temp_path = parent.join(temp_name);
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)
+            .with_context(|| format!("failed to create {}", temp_path.display()))?;
+        file.write_all(updated.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, &config_path)
+            .with_context(|| format!("failed to replace {}", config_path.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn update_preferences_document(
+    source: &str,
+    preferences: &DictationPreferences,
+) -> anyhow::Result<String> {
+    let mut document = source.parse::<toml_edit::DocumentMut>()?;
+    set_string_preserving_decor(
+        &mut document["input"]["output_mode"],
+        &preferences.output_mode.to_string(),
+    );
+    set_string_preserving_decor(&mut document["audio"]["device"], &preferences.audio_device);
+    Ok(document.to_string())
+}
+
+fn set_string_preserving_decor(item: &mut toml_edit::Item, new_value: &str) {
+    let decor = item.as_value().map(|value| value.decor().clone());
+    *item = toml_edit::value(new_value);
+    if let (Some(decor), Some(value)) = (decor, item.as_value_mut()) {
+        *value.decor_mut() = decor;
     }
 }
 
@@ -132,7 +336,11 @@ const TRAY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1
 /// Runs in the background and updates the icon whenever the daemon state changes.
 /// Retries with exponential backoff if the SNI host isn't available yet (common
 /// on boot when the daemon starts before the desktop environment is fully ready).
-pub async fn spawn_tray(mut state_rx: watch::Receiver<State>) {
+pub async fn spawn_tray(
+    mut state_rx: watch::Receiver<State>,
+    preferences: Arc<RwLock<DictationPreferences>>,
+    audio_devices: Vec<InputDeviceChoice>,
+) {
     // Retry spawning the tray with exponential backoff.
     let mut delay = TRAY_INITIAL_DELAY;
     let mut handle = None;
@@ -142,6 +350,8 @@ pub async fn spawn_tray(mut state_rx: watch::Receiver<State>) {
             state: TrayState {
                 current: *state_rx.borrow(),
             },
+            preferences: Arc::clone(&preferences),
+            audio_devices: audio_devices.clone(),
         };
 
         match tray.spawn().await {
@@ -182,4 +392,40 @@ pub async fn spawn_tray(mut state_rx: watch::Receiver<State>) {
                 .await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preference_update_preserves_unrelated_config_and_comments() {
+        let source = r#"# keep this comment
+[general]
+backend = "groq"
+
+[groq]
+api_key = "secret-value"
+
+[audio]
+device = "default" # existing comment
+
+[input]
+key_delay_ms = 7
+"#;
+        let updated = update_preferences_document(
+            source,
+            &DictationPreferences {
+                output_mode: OutputMode::Paste,
+                audio_device: "USB Microphone".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("api_key = \"secret-value\""));
+        assert!(updated.contains("device = \"USB Microphone\" # existing comment"));
+        assert!(updated.contains("output_mode = \"paste\""));
+        assert!(updated.contains("key_delay_ms = 7"));
+    }
 }

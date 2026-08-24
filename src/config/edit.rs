@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use dialoguer::{Confirm, Editor, Input, Select};
 
 use crate::config::setup;
-use crate::{Config, RestartOutcome};
+use crate::{Config, OutputMode, RestartOutcome};
 
 use setup::{BOLD, DIM, GREEN, RED, RESET, YELLOW};
 
@@ -51,7 +51,7 @@ pub fn run_config_menu() -> Result<()> {
             "Filler words",
             "Vocabulary & prompt",
             "Audio device",
-            "Keyboard injection (key delay)",
+            "Text output & keyboard injection",
             "Hotkeys",
             "Tray & overlay",
             "Command mode (LLM)",
@@ -381,7 +381,25 @@ fn list_input_devices() -> Vec<String> {
 }
 
 fn edit_key_delay(config: &mut Config) -> Result<()> {
-    println!("\n  {BOLD}Keyboard injection{RESET}");
+    println!("\n  {BOLD}Text output & keyboard injection{RESET}");
+    let mode = Select::new()
+        .with_prompt("Insert completed transcripts by")
+        .items(&[
+            "Typing individual keys",
+            "Pasting all text at once (restores clipboard)",
+        ])
+        .default(match config.input.output_mode {
+            OutputMode::Type => 0,
+            OutputMode::Paste => 1,
+        })
+        .interact()
+        .context("failed to read output mode")?;
+    config.input.output_mode = if mode == 1 {
+        OutputMode::Paste
+    } else {
+        OutputMode::Type
+    };
+
     println!(
         "  {DIM}Delay between simulated keystrokes. Raise this if characters are dropped \
          by TUI apps that read stdin in raw mode (e.g. Claude Code).{RESET}"

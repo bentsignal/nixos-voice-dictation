@@ -11,6 +11,10 @@ mod service;
 pub use service::spawn_tray;
 
 #[cfg(not(feature = "tray"))]
-pub async fn spawn_tray(_state_rx: tokio::sync::watch::Receiver<crate::State>) {
+pub async fn spawn_tray(
+    _state_rx: tokio::sync::watch::Receiver<crate::State>,
+    _preferences: std::sync::Arc<std::sync::RwLock<crate::DictationPreferences>>,
+    _audio_devices: Vec<crate::audio::capture::InputDeviceChoice>,
+) {
     // Tray feature not enabled — no-op.
 }

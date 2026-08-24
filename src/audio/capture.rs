@@ -20,6 +20,191 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// Number of channels (mono).
 const CHANNELS: u16 = 1;
 
+/// Prefix used for a specific native PipeWire source. The suffix is the
+/// stable PipeWire `node.name` passed to `pw-record --target`.
+pub const PIPEWIRE_NODE_PREFIX: &str = "pipewire-node:";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputDeviceChoice {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PipeWireCaptureLayout {
+    channels: u16,
+    channel_map: Option<String>,
+    apple_t2: bool,
+}
+
+impl Default for PipeWireCaptureLayout {
+    fn default() -> Self {
+        Self {
+            channels: CHANNELS,
+            channel_map: None,
+            apple_t2: false,
+        }
+    }
+}
+
+/// Return logical microphone choices for the tray.
+///
+/// On PipeWire, enumerate source nodes directly. This yields one entry per
+/// physical/logical microphone (including Apple T2 internal microphones)
+/// instead of ALSA's repetitive `front`/`digital`/`surround` PCM profiles.
+/// CPAL/ALSA remains the fallback on systems without PipeWire tools.
+pub fn input_device_choices(configured_device: &str) -> Vec<InputDeviceChoice> {
+    let mut choices = pipewire_source_choices();
+    if !choices.is_empty() {
+        choices.insert(
+            0,
+            InputDeviceChoice {
+                id: "pipewire".to_string(),
+                label: "PipeWire default".to_string(),
+            },
+        );
+    } else {
+        choices.push(InputDeviceChoice {
+            id: "default".to_string(),
+            label: "System default".to_string(),
+        });
+        choices.extend(
+            cpal_input_device_names()
+                .into_iter()
+                .map(|name| InputDeviceChoice {
+                    label: name.clone(),
+                    id: name,
+                }),
+        );
+    }
+
+    if !choices.iter().any(|choice| choice.id == configured_device) {
+        choices.insert(
+            0,
+            InputDeviceChoice {
+                id: configured_device.to_string(),
+                label: configured_device.to_string(),
+            },
+        );
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    choices.retain(|choice| seen.insert(choice.id.clone()));
+    choices
+}
+
+fn cpal_input_device_names() -> Vec<String> {
+    let host = cpal::default_host();
+    let mut names: Vec<String> = host
+        .input_devices()
+        .map(|devices| devices.filter_map(|device| device.name().ok()).collect())
+        .unwrap_or_default();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn pipewire_source_choices() -> Vec<InputDeviceChoice> {
+    let Some(objects) = pipewire_objects() else {
+        return Vec::new();
+    };
+    pipewire_source_choices_from(&objects)
+}
+
+fn pipewire_objects() -> Option<serde_json::Value> {
+    let output = std::process::Command::new("pw-dump").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+fn pipewire_source_choices_from(objects: &serde_json::Value) -> Vec<InputDeviceChoice> {
+    let Some(objects) = objects.as_array() else {
+        return Vec::new();
+    };
+
+    let mut choices: Vec<InputDeviceChoice> = objects
+        .iter()
+        .filter(|object| {
+            object.get("type").and_then(|v| v.as_str()) == Some("PipeWire:Interface:Node")
+        })
+        .filter_map(|object| object.get("info")?.get("props"))
+        .filter(|props| props.get("media.class").and_then(|v| v.as_str()) == Some("Audio/Source"))
+        .filter_map(|props| {
+            let node_name = props.get("node.name")?.as_str()?;
+            let label = props
+                .get("node.description")
+                .and_then(|v| v.as_str())
+                .or_else(|| props.get("node.nick").and_then(|v| v.as_str()))
+                .unwrap_or(node_name);
+            Some(InputDeviceChoice {
+                id: format!("{PIPEWIRE_NODE_PREFIX}{node_name}"),
+                label: label.to_string(),
+            })
+        })
+        .collect();
+    choices.sort_by_key(|choice| choice.label.to_lowercase());
+    choices
+}
+
+fn pipewire_capture_layout(target: &str) -> PipeWireCaptureLayout {
+    pipewire_objects()
+        .as_ref()
+        .and_then(|objects| pipewire_capture_layout_from(objects, target))
+        .unwrap_or_default()
+}
+
+fn pipewire_capture_layout_from(
+    objects: &serde_json::Value,
+    target: &str,
+) -> Option<PipeWireCaptureLayout> {
+    let props = objects.as_array()?.iter().find_map(|object| {
+        let props = object.get("info")?.get("props")?;
+        (props.get("media.class")?.as_str()? == "Audio/Source"
+            && props.get("node.name")?.as_str()? == target)
+            .then_some(props)
+    })?;
+
+    let channels = props
+        .get("audio.channels")?
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())?;
+    if channels <= CHANNELS || channels > 64 {
+        return Some(PipeWireCaptureLayout::default());
+    }
+
+    let apple_t2 = ["alsa.card_name", "api.alsa.card.name"]
+        .into_iter()
+        .filter_map(|key| props.get(key).and_then(|value| value.as_str()))
+        .any(|name| name == "Apple T2 Audio");
+
+    let positions = props.get("audio.position")?.as_str()?;
+    let channel_map = parse_pipewire_channel_map(positions, channels)?;
+    Some(PipeWireCaptureLayout {
+        channels,
+        channel_map: Some(channel_map),
+        apple_t2,
+    })
+}
+
+fn parse_pipewire_channel_map(positions: &str, channels: u16) -> Option<String> {
+    let positions = positions.trim().strip_prefix('[')?.strip_suffix(']')?;
+    let names: Vec<&str> = positions
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.len() != usize::from(channels)
+        || names
+            .iter()
+            .any(|name| !name.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        return None;
+    }
+    Some(names.join(","))
+}
+
 /// A handle to a running audio capture session.
 ///
 /// The actual `cpal::Stream` lives on a dedicated thread (since it's not Send).
@@ -165,6 +350,10 @@ fn setup_and_run(
     level_tx: Option<tokio::sync::watch::Sender<f32>>,
     configured_device: &str,
 ) -> anyhow::Result<()> {
+    if let Some(target) = configured_device.strip_prefix(PIPEWIRE_NODE_PREFIX) {
+        return setup_and_run_pipewire(tx, stop_signal, init_tx, level_tx, target);
+    }
+
     let host = cpal::default_host();
     let device = if configured_device.eq_ignore_ascii_case("default") {
         host.default_input_device()
@@ -248,6 +437,208 @@ fn setup_and_run(
     drop(stream);
 
     Ok(())
+}
+
+fn setup_and_run_pipewire(
+    tx: mpsc::UnboundedSender<AudioChunk>,
+    stop_signal: Arc<AtomicBool>,
+    init_tx: &std::sync::mpsc::Sender<anyhow::Result<()>>,
+    level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    target: &str,
+) -> anyhow::Result<()> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let layout = pipewire_capture_layout(target);
+    let sample_rate = SAMPLE_RATE.to_string();
+    let channels = layout.channels.to_string();
+    let mut command = std::process::Command::new("pw-record");
+    command.args([
+        "--target",
+        target,
+        "--rate",
+        &sample_rate,
+        "--channels",
+        &channels,
+    ]);
+    if let Some(channel_map) = &layout.channel_map {
+        command.args(["--channel-map", channel_map]);
+    }
+    let mut child = command
+        .args(["--format", "s16", "--raw", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start pw-record for the selected PipeWire microphone")?;
+
+    // Give PipeWire a moment to resolve and link the requested node so an
+    // invalid/stale target fails before the daemon reports recording started.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    if let Some(status) = child.try_wait().context("failed to poll pw-record")? {
+        let mut stderr = String::new();
+        if let Some(mut stream) = child.stderr.take() {
+            let _ = stream.read_to_string(&mut stderr);
+        }
+        anyhow::bail!(
+            "pw-record could not open PipeWire microphone {target}: {}{}",
+            status,
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", stderr.trim())
+            }
+        );
+    }
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("pw-record stdout was not available")?;
+    init_tx.send(Ok(())).ok();
+    info!(
+        "using PipeWire input source: {target} ({} channel{}{})",
+        layout.channels,
+        if layout.channels == 1 { "" } else { "s" },
+        if layout.apple_t2 {
+            ", Apple T2 microphone conditioning enabled"
+        } else {
+            ""
+        }
+    );
+
+    let mut bytes = [0_u8; 3200];
+    let mut pending_byte = None;
+    let mut pending_samples = Vec::new();
+    let channels = usize::from(layout.channels);
+    let mut mono_processor = PipeWireMonoProcessor::new(channels, layout.apple_t2);
+    while !stop_signal.load(Ordering::Acquire) {
+        let count = stdout
+            .read(&mut bytes)
+            .context("failed to read pw-record audio")?;
+        if count == 0 {
+            break;
+        }
+        let mut sample_bytes = Vec::with_capacity(count + 1);
+        if let Some(byte) = pending_byte.take() {
+            sample_bytes.push(byte);
+        }
+        sample_bytes.extend_from_slice(&bytes[..count]);
+        if sample_bytes.len() % 2 != 0 {
+            pending_byte = sample_bytes.pop();
+        }
+        pending_samples.extend(
+            sample_bytes
+                .chunks_exact(2)
+                .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+        );
+        let complete_len = pending_samples.len() / channels * channels;
+        if complete_len == 0 {
+            continue;
+        }
+        let samples = mono_processor.process(&pending_samples[..complete_len]);
+        pending_samples.drain(..complete_len);
+        if let Some(level_tx) = &level_tx {
+            let _ = level_tx.send(audio_level(&samples));
+        }
+        if tx.send(samples).is_err() {
+            break;
+        }
+    }
+
+    let _ = child.kill();
+    let status = child.wait().context("failed to wait for pw-record")?;
+    if let Some(level_tx) = &level_tx {
+        let _ = level_tx.send(0.0);
+    }
+    debug!("PipeWire audio capture stopped ({status})");
+    Ok(())
+}
+
+/// Stateful downmix and conditioning for native PipeWire sources.
+///
+/// Apple T2 microphone arrays expose quiet, largely unprocessed raw channels.
+/// The normal desktop DSP applies a substantial gain stage and DC/rumble
+/// filtering before applications see the microphone. Keep that workaround
+/// local to whisrs so USB microphones and the machine's global speaker/audio
+/// configuration are unaffected.
+struct PipeWireMonoProcessor {
+    channels: usize,
+    apple_t2: bool,
+    selected_channel: Option<usize>,
+    previous_input: f32,
+    previous_output: f32,
+}
+
+impl PipeWireMonoProcessor {
+    fn new(channels: usize, apple_t2: bool) -> Self {
+        Self {
+            channels: channels.max(1),
+            apple_t2,
+            selected_channel: None,
+            previous_input: 0.0,
+            previous_output: 0.0,
+        }
+    }
+
+    fn process(&mut self, samples: &[i16]) -> Vec<i16> {
+        if !self.apple_t2 {
+            return strongest_channel_mono(samples, self.channels);
+        }
+
+        let channel = *self
+            .selected_channel
+            .get_or_insert_with(|| strongest_channel_index(samples, self.channels));
+        // One-pole 120 Hz high-pass at the 16 kHz capture rate, followed by
+        // the same broad gain magnitude used by the community T2 mic DSP.
+        const HIGH_PASS_ALPHA: f32 = 0.955;
+        const GAIN: f32 = 80.0;
+        samples
+            .chunks_exact(self.channels)
+            .map(|frame| {
+                let input = frame[channel] as f32 / i16::MAX as f32;
+                let filtered =
+                    HIGH_PASS_ALPHA * (self.previous_output + input - self.previous_input);
+                self.previous_input = input;
+                self.previous_output = filtered;
+                (filtered * GAIN)
+                    .clamp(-1.0, 1.0)
+                    .mul_add(i16::MAX as f32, 0.0) as i16
+            })
+            .collect()
+    }
+}
+
+/// Reduce an interleaved microphone stream to mono by retaining the channel
+/// with the strongest signal in this chunk. This handles microphone arrays
+/// whose PipeWire positions cannot be remixed to `MONO` (notably Apple T2's
+/// AUX0/AUX1/AUX2 array), and is also useful for multichannel audio interfaces
+/// where only one input is connected.
+fn strongest_channel_mono(samples: &[i16], channels: usize) -> Vec<i16> {
+    if channels <= 1 {
+        return samples.to_vec();
+    }
+
+    let strongest = strongest_channel_index(samples, channels);
+    samples
+        .chunks_exact(channels)
+        .map(|frame| frame[strongest])
+        .collect()
+}
+
+fn strongest_channel_index(samples: &[i16], channels: usize) -> usize {
+    let mut energy = vec![0_u64; channels.max(1)];
+    for frame in samples.chunks_exact(channels) {
+        for (channel, sample) in frame.iter().enumerate() {
+            let sample = i64::from(*sample);
+            energy[channel] = energy[channel].saturating_add((sample * sample) as u64);
+        }
+    }
+    energy
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, value)| *value)
+        .map(|(index, _)| index)
+        .unwrap_or(0)
 }
 
 fn audio_level(data: &[i16]) -> f32 {
@@ -344,5 +735,129 @@ mod tests {
     #[test]
     fn audio_level_silence_is_zero() {
         assert_eq!(audio_level(&[0; 256]), 0.0);
+    }
+
+    #[test]
+    fn pipewire_choices_are_one_per_source_node() {
+        let dump = serde_json::json!([
+            {
+                "type": "PipeWire:Interface:Node",
+                "info": { "props": {
+                    "media.class": "Audio/Source",
+                    "node.name": "alsa_input.internal",
+                    "node.description": "Internal Microphone"
+                }}
+            },
+            {
+                "type": "PipeWire:Interface:Node",
+                "info": { "props": {
+                    "media.class": "Audio/Sink",
+                    "node.name": "alsa_output.speakers",
+                    "node.description": "Speakers"
+                }}
+            }
+        ]);
+
+        assert_eq!(
+            pipewire_source_choices_from(&dump),
+            vec![InputDeviceChoice {
+                id: format!("{PIPEWIRE_NODE_PREFIX}alsa_input.internal"),
+                label: "Internal Microphone".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn pipewire_capture_preserves_multichannel_array_layout() {
+        let dump = serde_json::json!([
+            {
+                "type": "PipeWire:Interface:Node",
+                "info": { "props": {
+                    "media.class": "Audio/Source",
+                    "node.name": "alsa_input.apple_t2",
+                    "alsa.card_name": "Apple T2 Audio",
+                    "audio.channels": 3,
+                    "audio.position": "[ AUX0, AUX1, AUX2 ]"
+                }}
+            }
+        ]);
+
+        assert_eq!(
+            pipewire_capture_layout_from(&dump, "alsa_input.apple_t2"),
+            Some(PipeWireCaptureLayout {
+                channels: 3,
+                channel_map: Some("AUX0,AUX1,AUX2".to_string()),
+                apple_t2: true,
+            })
+        );
+    }
+
+    #[test]
+    fn pipewire_capture_layout_rejects_mismatched_positions() {
+        let dump = serde_json::json!([
+            {
+                "info": { "props": {
+                    "media.class": "Audio/Source",
+                    "node.name": "broken",
+                    "audio.channels": 3,
+                    "audio.position": "[ AUX0, AUX1 ]"
+                }}
+            }
+        ]);
+
+        assert_eq!(pipewire_capture_layout_from(&dump, "broken"), None);
+    }
+
+    #[test]
+    fn strongest_channel_is_selected_for_mono_capture() {
+        // Three interleaved channels; the middle channel carries the signal.
+        let samples = [1, 100, 2, 3, -200, 4, 5, 300, 6];
+        assert_eq!(strongest_channel_mono(&samples, 3), vec![100, -200, 300]);
+    }
+
+    #[test]
+    fn mono_capture_is_unchanged() {
+        let samples = [1, -2, 3, -4];
+        assert_eq!(strongest_channel_mono(&samples, 1), samples);
+    }
+
+    #[test]
+    fn apple_t2_conditioning_boosts_weak_audio() {
+        let mut processor = PipeWireMonoProcessor::new(3, true);
+        let mut input = Vec::new();
+        for index in 0..800 {
+            let sample = if index % 20 < 10 { 100 } else { -100 };
+            input.extend_from_slice(&[sample, sample / 2, sample / 4]);
+        }
+        let output = processor.process(&input);
+        assert_eq!(output.len(), 800);
+        assert!(output.iter().map(|sample| sample.abs()).max().unwrap() > 2_000);
+    }
+
+    #[test]
+    fn apple_t2_conditioning_removes_steady_dc() {
+        let mut processor = PipeWireMonoProcessor::new(3, true);
+        let output = processor.process(&[500_i16; 3 * 2_000]);
+        assert!(output.last().unwrap().abs() < 10);
+    }
+
+    /// Opt-in hardware check used by maintainers to exercise a real PipeWire
+    /// source without making the normal test suite depend on audio hardware.
+    #[tokio::test]
+    async fn selected_pipewire_source_captures_audio_when_requested() {
+        let Ok(target) = std::env::var("WHISRS_TEST_PIPEWIRE_TARGET") else {
+            return;
+        };
+        let capture = AudioCaptureHandle::start_with_device_and_level_tx(&target, None).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        let samples = capture.stop_and_collect().await.unwrap();
+        assert!(
+            !samples.is_empty(),
+            "selected PipeWire source returned no audio"
+        );
+        assert!(
+            samples.iter().any(|sample| *sample != 0),
+            "selected PipeWire source returned only silence"
+        );
     }
 }

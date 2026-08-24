@@ -33,6 +33,10 @@ enum OverlayError {
     Pixmap(u32, u32),
 }
 
+use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::{
+    wp_viewport::{self, WpViewport},
+    wp_viewporter::{self, WpViewporter},
+};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
@@ -239,6 +243,8 @@ pub async fn spawn_overlay(
 
     let (tx, rx) = mpsc::channel::<State>();
     let (level_tx, level_rx_thread) = mpsc::channel::<f32>();
+    let (focused_output_tx, focused_output_rx) = mpsc::channel::<String>();
+    spawn_hyprland_focused_output_watcher(state_rx.clone(), focused_output_tx);
 
     let backend = OverlayBackend::detect();
     info!("overlay backend selected: {backend:?}");
@@ -247,7 +253,9 @@ pub async fn spawn_overlay(
         .name("whisrs-overlay".to_string())
         .spawn(move || {
             let result = match backend {
-                OverlayBackend::Wayland => run_overlay(rx, level_rx_thread, overlay_config),
+                OverlayBackend::Wayland => {
+                    run_overlay(rx, level_rx_thread, focused_output_rx, overlay_config)
+                }
                 OverlayBackend::X11 => run_x11_overlay(rx, level_rx_thread, overlay_config),
                 OverlayBackend::Unavailable => {
                     warn!("overlay unavailable: no Wayland or X11 display in environment");
@@ -277,6 +285,71 @@ pub async fn spawn_overlay(
             }
         }
     });
+}
+
+fn spawn_hyprland_focused_output_watcher(
+    mut state_rx: watch::Receiver<State>,
+    focused_output_tx: mpsc::Sender<String>,
+) {
+    if !env_var_is_set("HYPRLAND_INSTANCE_SIGNATURE") {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut active = *state_rx.borrow() != State::Idle;
+        let mut last_output = None;
+
+        loop {
+            let should_query = tokio::select! {
+                changed = state_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let was_active = active;
+                    active = *state_rx.borrow() != State::Idle;
+                    active && !was_active
+                }
+                _ = interval.tick(), if active => true,
+            };
+            if !should_query {
+                continue;
+            }
+
+            let Some(output_name) = query_hyprland_focused_output().await else {
+                continue;
+            };
+            if last_output.as_deref() == Some(output_name.as_str()) {
+                continue;
+            }
+            last_output = Some(output_name.clone());
+            if focused_output_tx.send(output_name).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+async fn query_hyprland_focused_output() -> Option<String> {
+    let output = tokio::process::Command::new("hyprctl")
+        .args(["activeworkspace", "-j"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_hyprland_active_workspace_output(&output.stdout)
+}
+
+fn parse_hyprland_active_workspace_output(stdout: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    value
+        .get("monitor")?
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -430,6 +503,7 @@ impl GnomeOverlayBus {
 fn run_overlay(
     state_rx: mpsc::Receiver<State>,
     level_rx: mpsc::Receiver<f32>,
+    focused_output_rx: mpsc::Receiver<String>,
     config: OverlayConfig,
 ) -> Result<(), OverlayError> {
     let width = config.clamped_width();
@@ -445,29 +519,34 @@ fn run_overlay(
     let layer_shell = LayerShell::bind(&globals, &qh)?;
     let shm = Shm::bind(&globals, &qh)?;
 
-    let surface = compositor.create_surface(&qh);
-    let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("whisrs"), None);
-    layer.set_anchor(Anchor::BOTTOM);
-    layer.set_margin(0, 0, BOTTOM_MARGIN, 0);
-    layer.set_exclusive_zone(0);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-    layer.set_size(width, height);
-
-    // Make the transparent overlay non-interactive so it never blocks clicks.
-    let input_region = compositor.wl_compositor().create_region(&qh, ());
-    layer.set_input_region(Some(&input_region));
-    input_region.destroy();
-
-    layer.commit();
+    // Viewporter lets us submit a 2x render buffer while retaining the exact
+    // logical layer-shell size. It is optional so the overlay still works on
+    // older compositors, just without HiDPI supersampling.
+    let viewporter = globals.bind(&qh, 1..=1, ()).ok();
+    let (layer, viewport) = create_overlay_layer(
+        &compositor,
+        &layer_shell,
+        viewporter.as_ref(),
+        &qh,
+        width,
+        height,
+        None,
+    );
 
     let pool = SlotPool::new((width * height * 4) as usize, &shm)?;
     let mut overlay = Overlay {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
+        compositor,
+        layer_shell,
+        viewporter,
+        viewport,
         shm,
         pool,
         layer,
+        focused_output_rx,
+        desired_output_name: None,
+        current_output_name: None,
         renderer: OverlayRenderer::new(state_rx, level_rx, width, height, theme, sensitivity)?,
         logical_width: width,
         logical_height: height,
@@ -478,6 +557,7 @@ fn run_overlay(
     info!("recording overlay started");
     while !overlay.exit {
         overlay.renderer.apply_state_updates();
+        overlay.apply_focused_output(&qh);
         if overlay.renderer.disconnected {
             break;
         }
@@ -485,6 +565,38 @@ fn run_overlay(
     }
 
     Ok(())
+}
+
+fn create_overlay_layer(
+    compositor: &CompositorState,
+    layer_shell: &LayerShell,
+    viewporter: Option<&WpViewporter>,
+    qh: &QueueHandle<Overlay>,
+    width: u32,
+    height: u32,
+    output: Option<&wl_output::WlOutput>,
+) -> (LayerSurface, Option<WpViewport>) {
+    let surface = compositor.create_surface(qh);
+    let layer =
+        layer_shell.create_layer_surface(qh, surface, Layer::Overlay, Some("whisrs"), output);
+    layer.set_anchor(Anchor::BOTTOM);
+    layer.set_margin(0, 0, BOTTOM_MARGIN, 0);
+    layer.set_exclusive_zone(0);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+    layer.set_size(width, height);
+
+    let viewport = viewporter.map(|viewporter| {
+        let viewport = viewporter.get_viewport(layer.wl_surface(), qh, ());
+        viewport.set_destination(width as i32, height as i32);
+        viewport
+    });
+
+    // Make the transparent overlay non-interactive so it never blocks clicks.
+    let input_region = compositor.wl_compositor().create_region(qh, ());
+    layer.set_input_region(Some(&input_region));
+    input_region.destroy();
+    layer.commit();
+    (layer, viewport)
 }
 
 fn run_x11_overlay(
@@ -983,9 +1095,16 @@ fn to_i16_coord(value: i32) -> i16 {
 struct Overlay {
     registry_state: RegistryState,
     output_state: OutputState,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    viewporter: Option<WpViewporter>,
+    viewport: Option<WpViewport>,
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
+    focused_output_rx: mpsc::Receiver<String>,
+    desired_output_name: Option<String>,
+    current_output_name: Option<String>,
     renderer: OverlayRenderer,
     logical_width: u32,
     logical_height: u32,
@@ -1082,11 +1201,16 @@ impl OverlayRenderer {
         })
     }
 
-    fn set_output_scale(&mut self, scale: u32) -> Result<(), OverlayError> {
+    fn resize_for_scale(
+        &mut self,
+        logical_width: u32,
+        logical_height: u32,
+        scale: u32,
+    ) -> Result<(), OverlayError> {
         let scale = scale.max(1);
         self.scale = scale as f32;
-        self.width = self.width.saturating_mul(scale);
-        self.height = self.height.saturating_mul(scale);
+        self.width = logical_width.saturating_mul(scale);
+        self.height = logical_height.saturating_mul(scale);
         self.pixmap = Pixmap::new(self.width, self.height)
             .ok_or(OverlayError::Pixmap(self.width, self.height))?;
         Ok(())
@@ -1248,6 +1372,48 @@ impl OverlayRenderer {
 }
 
 impl Overlay {
+    fn apply_focused_output(&mut self, qh: &QueueHandle<Self>) {
+        while let Ok(name) = self.focused_output_rx.try_recv() {
+            self.desired_output_name = Some(name);
+        }
+
+        let Some(desired_name) = self.desired_output_name.clone() else {
+            return;
+        };
+        if self.current_output_name.as_deref() == Some(&desired_name) {
+            return;
+        }
+
+        let target_output = self.output_state.outputs().find(|output| {
+            self.output_state
+                .info(output)
+                .and_then(|info| info.name)
+                .as_deref()
+                == Some(desired_name.as_str())
+        });
+        let Some(target_output) = target_output else {
+            return;
+        };
+
+        let (new_layer, new_viewport) = create_overlay_layer(
+            &self.compositor,
+            &self.layer_shell,
+            self.viewporter.as_ref(),
+            qh,
+            self.logical_width,
+            self.logical_height,
+            Some(&target_output),
+        );
+        if let Some(viewport) = self.viewport.take() {
+            viewport.destroy();
+        }
+        self.layer = new_layer;
+        self.viewport = new_viewport;
+        self.current_output_name = Some(desired_name.clone());
+        self.first_configure = true;
+        info!("recording overlay moved to output {desired_name}");
+    }
+
     fn draw(&mut self, qh: &QueueHandle<Self>) {
         let width = self.renderer.width;
         let height = self.renderer.height;
@@ -1346,18 +1512,20 @@ impl CompositorHandler for Overlay {
         &mut self,
         _conn: &WaylandConnection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
-        let scale = new_factor.max(1) as u32;
-        let current = self.renderer.scale as u32;
-        if scale == current {
+        if surface != self.layer.wl_surface() || self.viewport.is_none() {
             return;
         }
-        self.layer.wl_surface().set_buffer_scale(scale as i32);
-        self.renderer.width = self.logical_width;
-        self.renderer.height = self.logical_height;
-        if let Err(error) = self.renderer.set_output_scale(scale) {
+        let scale = new_factor.max(1) as u32;
+        if scale == self.renderer.scale as u32 {
+            return;
+        }
+        if let Err(error) =
+            self.renderer
+                .resize_for_scale(self.logical_width, self.logical_height, scale)
+        {
             warn!("failed to resize overlay for output scale {scale}: {error}");
             return;
         }
@@ -1383,9 +1551,12 @@ impl CompositorHandler for Overlay {
         &mut self,
         _conn: &WaylandConnection,
         qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
+        if surface != self.layer.wl_surface() {
+            return;
+        }
         self.draw(qh);
     }
 
@@ -1439,23 +1610,23 @@ impl OutputHandler for Overlay {
 }
 
 impl LayerShellHandler for Overlay {
-    fn closed(
-        &mut self,
-        _conn: &WaylandConnection,
-        _qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
-    ) {
-        self.exit = true;
+    fn closed(&mut self, _conn: &WaylandConnection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        if layer == &self.layer {
+            self.exit = true;
+        }
     }
 
     fn configure(
         &mut self,
         _conn: &WaylandConnection,
         qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
+        layer: &LayerSurface,
         _configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        if layer != &self.layer {
+            return;
+        }
         if self.first_configure {
             self.first_configure = false;
             self.draw(qh);
@@ -1466,6 +1637,32 @@ impl LayerShellHandler for Overlay {
 impl ShmHandler for Overlay {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for Overlay {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewporter,
+        _event: wp_viewporter::Event,
+        _data: &(),
+        _conn: &WaylandConnection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        unreachable!("wp_viewporter has no events")
+    }
+}
+
+impl Dispatch<WpViewport, ()> for Overlay {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewport,
+        _event: wp_viewport::Event,
+        _data: &(),
+        _conn: &WaylandConnection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        unreachable!("wp_viewport has no events")
     }
 }
 
@@ -1819,6 +2016,23 @@ mod tests {
 
     const W: u32 = 100;
     const H: u32 = 64;
+
+    #[test]
+    fn parses_hyprland_focused_output() {
+        let output = parse_hyprland_active_workspace_output(
+            br#"{"id":2,"name":"2","monitor":"eDP-1","monitorID":0}"#,
+        );
+        assert_eq!(output.as_deref(), Some("eDP-1"));
+    }
+
+    #[test]
+    fn rejects_hyprland_workspace_without_monitor() {
+        assert_eq!(parse_hyprland_active_workspace_output(br#"{"id":2}"#), None);
+        assert_eq!(
+            parse_hyprland_active_workspace_output(br#"{"monitor":""}"#),
+            None
+        );
+    }
 
     fn fresh_pixmap() -> Pixmap {
         Pixmap::new(W, H).unwrap()

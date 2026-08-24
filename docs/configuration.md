@@ -28,6 +28,7 @@ overlay = false             # bottom-screen recording overlay (Hyprland/Sway, GN
 # Defaults to a 100×40 pill with the "carbon" theme.
 # When the overlay is on, recording/transcribing toast notifications are
 # auto-suppressed (errors still pop) so the same event isn't double-signaled.
+# On Hyprland, it follows the focused monitor even if focus moves mid-recording.
 [overlay]
 theme = "carbon"            # "carbon" (default) | "ember" | "cyan" | "custom"
 width = 100                 # 90..=120 (clamped)
@@ -48,8 +49,14 @@ sensitivity = 1.0          # waveform gain, 0.1..=8.0
 
 [audio]
 device = "default"
+# The tray shows one entry per PipeWire source when `pw-dump`/`pw-record` are
+# available. Picking one stores `pipewire-node:<node.name>` here and captures
+# it directly without changing the system-wide default microphone.
 
 [input]
+# How to insert completed transcripts: "type" emits individual keystrokes;
+# "paste" inserts the whole result at once and restores the previous clipboard.
+output_mode = "paste"       # type (default) | paste
 # Inter-key delay for the virtual keyboard (uinput). Raise this if a TUI
 # drops characters while whisrs is typing — e.g. Node/Ink-based apps like
 # Claude Code in raw mode. Default: 2.
