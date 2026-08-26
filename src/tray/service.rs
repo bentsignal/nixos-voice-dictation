@@ -154,8 +154,46 @@ impl ksni::Tray for WhisrsTray {
             .iter()
             .position(|device| device.id == preferences.audio_device)
             .unwrap_or(0);
+        let has_transcription = crate::history::read_entries(1)
+            .map(|entries| !entries.is_empty())
+            .unwrap_or(false);
 
         vec![
+            StandardItem {
+                label: format!(
+                    "Microphone — {}",
+                    self.device_label(&preferences.audio_device)
+                ),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            RadioGroup {
+                selected: selected_device,
+                select: Box::new(|tray: &mut Self, selected| {
+                    let Some(device) = tray
+                        .audio_devices
+                        .get(selected)
+                        .map(|choice| choice.id.clone())
+                    else {
+                        return;
+                    };
+                    tray.update_preferences(|preferences| {
+                        preferences.audio_device = device;
+                    });
+                }),
+                options: self
+                    .audio_devices
+                    .iter()
+                    .map(|device| RadioItem {
+                        label: device.label.clone(),
+                        enabled,
+                        ..Default::default()
+                    })
+                    .collect(),
+            }
+            .into(),
+            ksni::MenuItem::Separator,
             StandardItem {
                 label: format!("Output — {}", preferences.output_mode),
                 enabled: false,
@@ -193,40 +231,57 @@ impl ksni::Tray for WhisrsTray {
             .into(),
             ksni::MenuItem::Separator,
             StandardItem {
-                label: format!(
-                    "Microphone — {}",
-                    self.device_label(&preferences.audio_device)
-                ),
-                enabled: false,
+                label: "Copy last transcription".to_string(),
+                enabled: has_transcription,
+                icon_name: "edit-copy".to_string(),
+                activate: Box::new(|_| copy_last_transcription()),
                 ..Default::default()
             }
             .into(),
-            RadioGroup {
-                selected: selected_device,
-                select: Box::new(|tray: &mut Self, selected| {
-                    let Some(device) = tray
-                        .audio_devices
-                        .get(selected)
-                        .map(|choice| choice.id.clone())
-                    else {
-                        return;
-                    };
-                    tray.update_preferences(|preferences| {
-                        preferences.audio_device = device;
-                    });
-                }),
-                options: self
-                    .audio_devices
-                    .iter()
-                    .map(|device| RadioItem {
-                        label: device.label.clone(),
-                        enabled,
-                        ..Default::default()
-                    })
-                    .collect(),
-            }
-            .into(),
         ]
+    }
+}
+
+/// Copy the most recent persisted transcription without blocking the tray's
+/// D-Bus menu callback while the clipboard backend does its work.
+fn copy_last_transcription() {
+    std::thread::spawn(|| {
+        let result = (|| -> anyhow::Result<String> {
+            let entry = crate::history::read_entries(1)?
+                .into_iter()
+                .next()
+                .context("no previous transcription is available yet")?;
+            xkb_type::default_clipboard()
+                .set_text(&entry.text)
+                .context("failed to copy the last transcription")?;
+            Ok(entry.text)
+        })();
+
+        match result {
+            Ok(text) => {
+                info!(
+                    "copied last transcription to clipboard ({} chars)",
+                    text.len()
+                );
+                show_copy_notification("Last transcription copied", "Ready to paste.");
+            }
+            Err(error) => {
+                warn!("could not copy last transcription: {error:#}");
+                show_copy_notification("Could not copy last transcription", &error.to_string());
+            }
+        }
+    });
+}
+
+fn show_copy_notification(summary: &str, body: &str) {
+    if let Err(error) = notify_rust::Notification::new()
+        .summary(summary)
+        .body(body)
+        .appname("whisrs")
+        .timeout(notify_rust::Timeout::Milliseconds(2000))
+        .show()
+    {
+        warn!("failed to show tray notification: {error}");
     }
 }
 
